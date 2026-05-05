@@ -811,6 +811,11 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
 
+        // Tensor too small for NPU alignment: skip NPU packing
+        if (K % pipeline->k_align != 0 || N % pipeline->n_align != 0) {
+            return 0;
+        }
+
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
 
         int k_limit = config.max_k_limit;
@@ -869,11 +874,13 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
 
-    // Initialize tensor only if it is supported by the pipeline
+    // Initialize tensor only if it is supported by the pipeline and has valid NPU dimensions
     if (pipeline) {
-        size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
         size_t size = get_tensor_packed_size(tensor);
-        ctx->get_tensor_allocation(offset, size);
+        if (size > 0) {
+            size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
+            ctx->get_tensor_allocation(offset, size);
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1072,6 +1079,22 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     if (pipeline) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
+
+        // Computing global scale
+        int k_limit = config.max_k_limit;
+        if (pipeline->effective_k > 0) {
+            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+        }
+
+        // Allocating a new buffer for a tensor
+        size_t required_size = get_tensor_packed_size(tensor);
+
+        // Skip NPU packing if the tensor is too small for NPU alignment
+        if (required_size == 0) {
+            memcpy((uint8_t*)tensor->data + offset, data, size);
+            return;
+        }
+
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
 
         // Initializing Hadamard Transform Logic
@@ -1088,14 +1111,6 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             ctx->hadamard_s_vectors[tensor] = s_vec;
         }
 
-        // Computing global scale
-        int k_limit = config.max_k_limit;
-        if (pipeline->effective_k > 0) {
-            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
-        }
-
-        // Allocating a new buffer for a tensor
-        size_t required_size = get_tensor_packed_size(tensor);
         auto alloc = ctx->get_tensor_allocation(tensor_offset_in_virtual, required_size);
         uint8_t* tensor_dma_ptr = (uint8_t*)alloc.mem->virt_addr;
 
@@ -1224,7 +1239,8 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
-    return get_tensor_packed_size(tensor);
+    size_t packed_size = get_tensor_packed_size(tensor);
+    return packed_size > 0 ? packed_size : ggml_nbytes(tensor);
 }
 
 
