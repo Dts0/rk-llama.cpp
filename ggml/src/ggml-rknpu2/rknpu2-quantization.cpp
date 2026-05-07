@@ -77,8 +77,9 @@ void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_ele
         int16x8_t s23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
         int8x16_t b8 = vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23));
         uint8x16_t u8 = vreinterpretq_u8_s8(b8);
-        uint8x8_t evens = vget_low_u8(u8);
-        uint8x8_t odds  = vget_high_u8(u8);
+        uint8x16x2_t pairs = vuzpq_u8(u8, u8);
+        uint8x8_t evens = vget_low_u8(pairs.val[0]);
+        uint8x8_t odds  = vget_low_u8(pairs.val[1]);
         uint8x8_t evens_lo = vand_u8(evens, vdup_n_u8(0x0F));
         uint8x8_t odds_lo  = vshl_n_u8(vand_u8(odds, vdup_n_u8(0x0F)), 4);
         uint8x8_t packed  = vorr_u8(evens_lo, odds_lo);
