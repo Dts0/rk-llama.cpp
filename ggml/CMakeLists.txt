@@ -260,6 +260,7 @@ set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
 
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
 option(GGML_RKNPU2                          "ggml: use RKNPU2"                                OFF)
+option(GGML_RKNPU2_DEBUG                    "ggml: enable RKNPU2 debug profiling"               OFF)
 set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
 # toolchain for vulkan-shaders-gen
