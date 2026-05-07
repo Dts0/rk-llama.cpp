@@ -12,6 +12,7 @@
 
 #include <omp.h>
 
+#include <chrono>
 #include <cassert>
 #include <cstring>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include <random>
 #include <limits>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sstream>
 
 #define UNUSED(x) (void)(x)
@@ -356,7 +358,7 @@ struct ggml_backend_rknpu_context {
     std::string name;
     std::mutex mutex;
 
-    // RKNN matmul contexts cache (tensor_fd, offset, M, K, N, core_id, type, domain_id)
+    // RKNN matmul contexts cache (tensor_id, offset, M, K, N, core_id, type, domain_id)
     std::unordered_map<std::tuple<uintptr_t, size_t, int, int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
 
     // A-matrices cache (M, K, npu_type_a, domain_id)
@@ -471,6 +473,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     // Getting the current device configuration once
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
 
+#ifdef GGML_RKNPU2_DEBUG
+    // Timing accumulators (us)
+    static int64_t t_setup = 0, t_prepA = 0, t_prepC = 0, t_npu = 0, t_collect = 0;
+    static int call_count = 0;
+#endif
+    int64_t node_t_setup = 0, node_t_prepA = 0, node_t_prepC = 0, node_t_npu = 0, node_t_collect = 0;
+    UNUSED(node_t_setup); UNUSED(node_t_prepA); UNUSED(node_t_prepC); UNUSED(node_t_npu); UNUSED(node_t_collect);
+
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
         if (node->op != GGML_OP_MUL_MAT) continue;
@@ -579,6 +589,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 1. Preparing Contexts ==========
             // ===========================================
+            auto t1_start = std::chrono::high_resolution_clock::now();
             for (const auto& n_seg : all_n_segments) {
                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
                     if (active_n_segments[idx].offset_n == n_seg.offset_n) {
@@ -625,6 +636,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 2. Preparing A-matrix ==========
             // ===========================================
+            auto t2_start = std::chrono::high_resolution_clock::now();
+            node_t_setup += std::chrono::duration_cast<std::chrono::microseconds>(t2_start - t1_start).count();
             std::vector<float> scales_A(M, 1.0f);
             {
                 auto cache_key = std::make_tuple(M_op, K_seg_op, (int)pipeline->npu_type_a, b_domain_id);
@@ -692,6 +705,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 3. Preparing C-matrix ==========
             // ===========================================
+            auto t3_start = std::chrono::high_resolution_clock::now();
+            node_t_prepA += std::chrono::duration_cast<std::chrono::microseconds>(t3_start - t2_start).count();
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     auto& matmul_ctx = matmul_ctxs[idx];
@@ -709,6 +724,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ==========================================
             // ========== 4. Running operation ==========
             // ==========================================
+            auto t4_start = std::chrono::high_resolution_clock::now();
+            node_t_prepC += std::chrono::duration_cast<std::chrono::microseconds>(t4_start - t3_start).count();
             {
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
@@ -722,6 +739,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 5. Collecting results ==========
             // ===========================================
+            auto t5_start = std::chrono::high_resolution_clock::now();
+            node_t_npu += std::chrono::duration_cast<std::chrono::microseconds>(t5_start - t4_start).count();
             {
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
@@ -744,7 +763,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 float* dst_ptr = dst_data + (size_t)m * N + N_offset;
                                 float* src_ptr = src_segment_base + (size_t)m * N_segment;
 
-                                for(int n=0; n<N_segment; ++n) {
+                                int n = 0;
+#ifdef __ARM_NEON
+                                const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
+                                for (; n + 3 < N_segment; n += 4) {
+                                    float32x4_t s = vld1q_f32(src_ptr + n);
+                                    float32x4_t d = vld1q_f32(dst_ptr + n);
+                                    vst1q_f32(dst_ptr + n, vmlaq_f32(d, s, scale_vec));
+                                }
+#endif
+                                for (; n < N_segment; ++n) {
                                     dst_ptr[n] += src_ptr[n] * dequant_scale;
                                 }
                             }
@@ -761,7 +789,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 float* dst_ptr = dst_data + (size_t)m * N + N_offset;
                                 int32_t* src_ptr = (int32_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
 
-                                for(int n=0; n<N_segment; ++n) {
+                                int n = 0;
+#ifdef __ARM_NEON
+                                const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
+                                for (; n + 3 < N_segment; n += 4) {
+                                    int32x4_t  s32 = vld1q_s32(src_ptr + n);
+                                    float32x4_t sf = vcvtq_f32_s32(s32);
+                                    float32x4_t df = vld1q_f32(dst_ptr + n);
+                                    vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                }
+#endif
+                                for (; n < N_segment; ++n) {
                                     dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
                                 }
                             }
@@ -778,7 +816,18 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 float* dst_ptr = dst_data + (size_t)m * N + N_offset;
                                 int16_t* src_ptr = (int16_t*)mem_C_segments[idx]->virt_addr + (size_t)m * N_segment;
 
-                                for(int n=0; n<N_segment; ++n) {
+                                int n = 0;
+#ifdef __ARM_NEON
+                                const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
+                                for (; n + 3 < N_segment; n += 4) {
+                                    int16x4_t s16 = vld1_s16(src_ptr + n);
+                                    int32x4_t s32 = vmovl_s16(s16);
+                                    float32x4_t sf = vcvtq_f32_s32(s32);
+                                    float32x4_t df = vld1q_f32(dst_ptr + n);
+                                    vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                }
+#endif
+                                for (; n < N_segment; ++n) {
                                     dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
                                 }
                             }
@@ -791,8 +840,27 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     }
                 }
             }
+            auto t6_start = std::chrono::high_resolution_clock::now();
+            node_t_collect += std::chrono::duration_cast<std::chrono::microseconds>(t6_start - t5_start).count();
         }
     }
+
+#ifdef GGML_RKNPU2_DEBUG
+    t_setup += node_t_setup; t_prepA += node_t_prepA; t_prepC += node_t_prepC;
+    t_npu += node_t_npu; t_collect += node_t_collect;
+    call_count++;
+
+    if (call_count > 0 && call_count % 50 == 0) {
+        int64_t total = t_setup + t_prepA + t_prepC + t_npu + t_collect;
+        int64_t avg_total = total / call_count;
+        fprintf(stderr, "\nRKNPU2 profile (%d calls, avg %lld us/call):\n", call_count, (long long)avg_total);
+        fprintf(stderr, "  Setup (ctx+B) : %6.1f%%  %lld us\n", 100.0*t_setup/total, (long long)t_setup/call_count);
+        fprintf(stderr, "  Prep A (quant): %6.1f%%  %lld us\n", 100.0*t_prepA/total, (long long)t_prepA/call_count);
+        fprintf(stderr, "  Prep C         : %6.1f%%  %lld us\n", 100.0*t_prepC/total, (long long)t_prepC/call_count);
+        fprintf(stderr, "  NPU run        : %6.1f%%  %lld us\n", 100.0*t_npu/total, (long long)t_npu/call_count);
+        fprintf(stderr, "  Collect (deq)  : %6.1f%%  %lld us\n", 100.0*t_collect/total, (long long)t_collect/call_count);
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -1343,6 +1411,13 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     UNUSED(dev);
     UNUSED(params);
+
+    // Increase fd limit to avoid "Too many open files" from DMA-BUF allocations
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+        rlim.rlim_cur = std::min(rlim.rlim_max, (rlim_t)32768);
+        setrlimit(RLIMIT_NOFILE, &rlim);
+    }
 
     // Fetch device from environment variable, default to RK3588 if not set
     const char* env_device = std::getenv("RKNPU_DEVICE");
