@@ -7,6 +7,11 @@
 #include <sstream>
 
 namespace {
+    bool trace_enabled() {
+        static const bool enabled = std::getenv("RKNPU_TRACE") != nullptr;
+        return enabled;
+    }
+
     // Function for parsing ENV variable
     std::vector<std::string> split_string(const std::string& str, char delimiter) {
         std::vector<std::string> tokens;
@@ -104,6 +109,14 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
 
     // If no hardware pipeline exists with this name, reject operation
     if (!pipeline) {
+        if (trace_enabled()) {
+            fprintf(stderr,
+                    "RKNPU trace: pipeline '%s' not found on device '%s' for tensor '%s' (type=%d)\n",
+                    selected_pipeline.c_str(),
+                    device_name.c_str(),
+                    w_tensor->name[0] ? w_tensor->name : "<unnamed>",
+                    (int)w_tensor->type);
+        }
         return nullptr;
     }
 
@@ -111,6 +124,9 @@ const Rknpu2HardwarePipeline* Rknpu2DeviceConfig::resolve_op_support(const struc
 }
 
 Rknpu2ConfigManager::Rknpu2ConfigManager() {
+    const char* env_device = std::getenv("RKNPU_DEVICE");
+    const std::string target_device = env_device ? env_device : "RK3588";
+
     // Reading custom hybrid pattern ENV variable
     const char* env_pattern = std::getenv("RKNPU_HYBRID");
     bool use_custom_pattern = false;
@@ -177,6 +193,17 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
             /* .use_hadamard  = */ true
+        },
+        {
+            /* .pipeline_name = */ "W8A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 32,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
         },
         {
             /* .pipeline_name = */ "W4A4_STANDARD",
@@ -265,6 +292,17 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .use_hadamard  = */ true
         },
         {
+            /* .pipeline_name = */ "W8A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 32,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
             /* .pipeline_name = */ "W4A4_STANDARD",
             /* .npu_type_a    = */ NPU_TYPE_INT4,
             /* .npu_type_b    = */ NPU_TYPE_INT4,
@@ -303,9 +341,16 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     // ... fill config for RK3566 ...
     // device_configs["RK3566"] = rk3566_config;
 
-    // Select a default device
-    if (!device_configs.empty()) {
+    if (!select_device(target_device) && !device_configs.empty()) {
         select_device(device_configs.begin()->first);
+    }
+
+    if (trace_enabled() && current_config != nullptr) {
+        fprintf(stderr,
+                "RKNPU trace: selected device '%s' (cores=%zu, max_k=%d)\n",
+                current_config->device_name.c_str(),
+                current_config->active_cores.size(),
+                current_config->max_k_limit);
     }
 }
 

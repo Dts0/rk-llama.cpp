@@ -736,15 +736,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             auto t4_start = std::chrono::high_resolution_clock::now();
             node_t_prepC += std::chrono::duration_cast<std::chrono::microseconds>(t4_start - t3_start).count();
 #endif
-            {
-                #pragma omp parallel for num_threads(num_active_segments)
-                for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
-                    if (ret != RKNN_SUCC) {
-                        // Handle error
-                    }
-                }
+    {
+        #pragma omp parallel for num_threads(num_active_segments)
+        for (size_t idx = 0; idx < num_active_segments; idx++) {
+            int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
+            if (ret != RKNN_SUCC) {
+                // Handle error
             }
+        }
+    }
 
             // ===========================================
             // ========== 5. Collecting results ==========
