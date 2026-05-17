@@ -1,4 +1,5 @@
 #include "binary-ops.h"
+#include "vec.h"
 
 #if defined(GGML_USE_ACCELERATE)
 #include <Accelerate/Accelerate.h>
@@ -24,6 +25,16 @@ static inline float op_div(float a, float b) {
 
 template <float (*op)(float, float), typename src0_t, typename src1_t, typename dst_t>
 static inline void vec_binary_op_contiguous(const int64_t n, dst_t * z, const src0_t * x, const src1_t * y) {
+    if constexpr (std::is_same_v<src0_t, float> && std::is_same_v<src1_t, float> && std::is_same_v<dst_t, float>) {
+        if constexpr (op == op_add) {
+            ggml_vec_add_f32(n, z, x, y);
+            return;
+        } else if constexpr (op == op_mul) {
+            ggml_vec_mul_f32(n, z, x, y);
+            return;
+        }
+    }
+
     constexpr auto src0_to_f32 = type_conversion_table<src0_t>::to_f32;
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
