@@ -10,6 +10,10 @@
 #include <rknn_api.h>
 #include <rknn_matmul_api.h>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #include <omp.h>
 
 #include <cassert>
@@ -32,6 +36,32 @@
 #endif
 
 #define UNUSED(x) (void)(x)
+
+static float fp32_abs_max(const float * src, int n) {
+    float amax = 0.0f;
+#ifdef __ARM_NEON
+    int i = 0;
+    float32x4_t maxv = vdupq_n_f32(0.0f);
+    for (; i + 15 < n; i += 16) {
+        maxv = vmaxq_f32(maxv, vabsq_f32(vld1q_f32(src + i)));
+        maxv = vmaxq_f32(maxv, vabsq_f32(vld1q_f32(src + i + 4)));
+        maxv = vmaxq_f32(maxv, vabsq_f32(vld1q_f32(src + i + 8)));
+        maxv = vmaxq_f32(maxv, vabsq_f32(vld1q_f32(src + i + 12)));
+    }
+    for (; i + 3 < n; i += 4) {
+        maxv = vmaxq_f32(maxv, vabsq_f32(vld1q_f32(src + i)));
+    }
+    amax = vmaxvq_f32(maxv);
+    for (; i < n; ++i) {
+        amax = std::max(amax, std::abs(src[i]));
+    }
+#else
+    for (int i = 0; i < n; ++i) {
+        amax = std::max(amax, std::abs(src[i]));
+    }
+#endif
+    return amax;
+}
 
 // --- IOMMU Domain Manager ---
 
@@ -660,6 +690,25 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 #pragma omp parallel for
                 for (int m = 0; m < M; ++m) {
                     const float* src_row = x + (size_t)m * row_stride;
+                    const float* src_seg = src_row + k_seg.offset_k;
+
+                    if (!is_hadamard && pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) {
+                        uint16_t* dst_ptr = (uint16_t*)dst_base;
+                        uint16_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
+                        rknpu2_quantization::convert_fp32_to_fp16(src_seg, dst_row, K_seg_op);
+                        continue;
+                    }
+
+                    if (!is_hadamard && pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
+                        const float amax_m = fp32_abs_max(src_seg, K_seg_op);
+                        scales_A[m] = amax_m / 127.0f;
+
+                        int8_t* dst_ptr = (int8_t*)dst_base;
+                        int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
+                        rknpu2_quantization::quantize_fp32_to_int8(src_seg, dst_row, K_seg_op, scales_A[m]);
+                        continue;
+                    }
+
                     std::vector<float> ready_row(K_seg_op);
 
                     // Applying Hadamard Transform
@@ -671,7 +720,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                         memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
                     } else {
-                        memcpy(ready_row.data(), src_row + k_seg.offset_k, K_seg_op * sizeof(float));
+                        memcpy(ready_row.data(), src_seg, K_seg_op * sizeof(float));
                     }
 
                     // Handling types and quantizations
@@ -754,6 +803,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             node_t_npu += std::chrono::duration_cast<std::chrono::microseconds>(t5_start - t4_start).count();
 #endif
             {
+                #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }

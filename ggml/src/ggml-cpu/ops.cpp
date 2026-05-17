@@ -3748,25 +3748,20 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
 
-    // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             for (int64_t i01 = ith; i01 < ne01; i01 += nth) {
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
+                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                ggml_float sum = 0.0;
-                // worth switching to explicit SIMD?
-                for (int64_t i00 = 0; i00 < ne00; i00++) {
-                    sum += (ggml_float)(x[i00] * x[i00]);
-                }
+                float sum = 0.0f;
+                ggml_vec_dot_f32(ne00, &sum, 0, x, 0, x, 0, 1);
 
-                const float mean  = sum/ne00;
+                const float mean = sum/ne00;
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
-
-                float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
                 if constexpr (FUSE_OP == GGML_RMS_NORM_FUSE_OP_MUL) {
                     const int64_t i11 = i01 % ne11;
@@ -3778,8 +3773,7 @@ static void ggml_compute_forward_rms_norm_f32(
                         y[i00] = x[i00] * scale * w[i00];
                     }
                 } else {
-                    memcpy(y, x, ne00 * sizeof(float));
-                    ggml_vec_scale_f32(ne00, y, scale);
+                    ggml_vec_mad1_f32(ne00, y, x, scale, 0.0f);
                 }
             }
         }
@@ -5342,17 +5336,14 @@ static void ggml_compute_forward_soft_max_f32(
                 ggml_fp16_t * mp_f16 = src1 ? (ggml_fp16_t *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
                 float       * mp_f32 = src1 ? (float       *)((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13) : NULL;
 
-                ggml_vec_cpy_f32  (ne00, wp, sp);
-                ggml_vec_scale_f32(ne00, wp, scale);
+                ggml_vec_mad1_f32(ne00, wp, sp, scale, 0.0f);
                 if (mp_f32) {
                     if (use_f16) {
                         for (int i = 0; i < ne00; ++i) {
                             wp[i] += slope*GGML_CPU_FP16_TO_FP32(mp_f16[i]);
                         }
                     } else {
-                        for (int i = 0; i < ne00; ++i) {
-                            wp[i] += slope*mp_f32[i];
-                        }
+                        ggml_vec_mad_f32(ne00, wp, mp_f32, slope);
                     }
                 }
 

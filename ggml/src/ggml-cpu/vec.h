@@ -66,6 +66,24 @@ inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, co
         __m256 vz = _mm256_add_ps(vx, vy);
         _mm256_storeu_ps(z + i, vz);
     }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 15 < n; i += 16) {
+        float32x4_t vx0 = vld1q_f32(x + i);
+        float32x4_t vy0 = vld1q_f32(y + i);
+        float32x4_t vx1 = vld1q_f32(x + i + 4);
+        float32x4_t vy1 = vld1q_f32(y + i + 4);
+        float32x4_t vx2 = vld1q_f32(x + i + 8);
+        float32x4_t vy2 = vld1q_f32(y + i + 8);
+        float32x4_t vx3 = vld1q_f32(x + i + 12);
+        float32x4_t vy3 = vld1q_f32(y + i + 12);
+        vst1q_f32(z + i,      vaddq_f32(vx0, vy0));
+        vst1q_f32(z + i + 4,  vaddq_f32(vx1, vy1));
+        vst1q_f32(z + i + 8,  vaddq_f32(vx2, vy2));
+        vst1q_f32(z + i + 12, vaddq_f32(vx3, vy3));
+    }
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(z + i, vaddq_f32(vld1q_f32(x + i), vld1q_f32(y + i)));
+    }
 #endif
     for (; i < n; ++i) {
         z[i] = x[i] + y[i];
@@ -95,7 +113,38 @@ inline static void ggml_vec_neg_f16 (const int n, ggml_fp16_t * y, const ggml_fp
     }
 }
 
-inline static void ggml_vec_mul_f32 (const int n, float * z, const float * x, const float * y) { for (int i = 0; i < n; ++i) z[i]  = x[i]*y[i];   }
+inline static void ggml_vec_mul_f32 (const int n, float * z, const float * x, const float * y) {
+    int i = 0;
+#if defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vy = _mm256_loadu_ps(y + i);
+        __m256 vz = _mm256_mul_ps(vx, vy);
+        _mm256_storeu_ps(z + i, vz);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 15 < n; i += 16) {
+        float32x4_t vx0 = vld1q_f32(x + i);
+        float32x4_t vy0 = vld1q_f32(y + i);
+        float32x4_t vx1 = vld1q_f32(x + i + 4);
+        float32x4_t vy1 = vld1q_f32(y + i + 4);
+        float32x4_t vx2 = vld1q_f32(x + i + 8);
+        float32x4_t vy2 = vld1q_f32(y + i + 8);
+        float32x4_t vx3 = vld1q_f32(x + i + 12);
+        float32x4_t vy3 = vld1q_f32(y + i + 12);
+        vst1q_f32(z + i,      vmulq_f32(vx0, vy0));
+        vst1q_f32(z + i + 4,  vmulq_f32(vx1, vy1));
+        vst1q_f32(z + i + 8,  vmulq_f32(vx2, vy2));
+        vst1q_f32(z + i + 12, vmulq_f32(vx3, vy3));
+    }
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(z + i, vmulq_f32(vld1q_f32(x + i), vld1q_f32(y + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        z[i] = x[i]*y[i];
+    }
+}
 inline static void ggml_vec_mul_f16 (const int n, ggml_fp16_t * z, const ggml_fp16_t * x, const ggml_fp16_t * y) {
     for (int i = 0; i < n; ++i) {
         z[i] = GGML_CPU_FP32_TO_FP16(GGML_CPU_FP16_TO_FP32(x[i]) * GGML_CPU_FP16_TO_FP32(y[i]));
@@ -1559,9 +1608,27 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
 #ifndef GGML_USE_ACCELERATE
     float max = -INFINITY;
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    int i = 0;
+    float32x4_t maxv = vdupq_n_f32(-INFINITY);
+    for (; i + 15 < n; i += 16) {
+        maxv = vmaxq_f32(maxv, vld1q_f32(x + i));
+        maxv = vmaxq_f32(maxv, vld1q_f32(x + i + 4));
+        maxv = vmaxq_f32(maxv, vld1q_f32(x + i + 8));
+        maxv = vmaxq_f32(maxv, vld1q_f32(x + i + 12));
+    }
+    for (; i + 3 < n; i += 4) {
+        maxv = vmaxq_f32(maxv, vld1q_f32(x + i));
+    }
+    max = vmaxvq_f32(maxv);
+    for (; i < n; ++i) {
+        max = MAX(max, x[i]);
+    }
+#else
     for (int i = 0; i < n; ++i) {
         max = MAX(max, x[i]);
     }
+#endif
     *s = max;
 #else
     vDSP_maxv(x, 1, s, n);
