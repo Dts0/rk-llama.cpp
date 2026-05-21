@@ -195,17 +195,6 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .use_hadamard  = */ true
         },
         {
-            /* .pipeline_name = */ "W8A16_STANDARD",
-            /* .npu_type_a    = */ NPU_TYPE_FP16,
-            /* .npu_type_b    = */ NPU_TYPE_INT8,
-            /* .npu_type_c    = */ NPU_TYPE_FP32,
-            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
-            /* .k_align       = */ 32,
-            /* .n_align       = */ 32,
-            /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
-        },
-        {
             /* .pipeline_name = */ "W4A4_STANDARD",
             /* .npu_type_a    = */ NPU_TYPE_INT4,
             /* .npu_type_b    = */ NPU_TYPE_INT4,
@@ -298,9 +287,20 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .npu_type_c    = */ NPU_TYPE_FP32,
             /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
             /* .k_align       = */ 32,
-            /* .n_align       = */ 32,
+            /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
             /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W8A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
         },
         {
             /* .pipeline_name = */ "W4A4_STANDARD",
@@ -323,6 +323,28 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
             /* .use_hadamard  = */ true
+        },
+        {
+            /* .pipeline_name = */ "W4A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W4A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
         }
     };
 
@@ -330,9 +352,9 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     rk3576_config.custom_hybrid_pattern = custom_pattern;
 
     rk3576_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
-    rk3576_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
-    rk3576_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
-    rk3576_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A4_HADAMARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A16_STANDARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A16_STANDARD", "W4A16_HADAMARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A16_HADAMARD"};
 
     device_configs["RK3576"] = rk3576_config;
 

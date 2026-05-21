@@ -37,6 +37,16 @@
 
 #define UNUSED(x) (void)(x)
 
+namespace {
+bool trace_enabled() {
+    static const bool enabled = std::getenv("RKNPU_TRACE") != nullptr;
+    return enabled;
+}
+
+std::once_flag trace_pipeline_once;
+std::once_flag trace_run_once;
+} // namespace
+
 static float fp32_abs_max(const float * src, int n) {
     float amax = 0.0f;
 #ifdef __ARM_NEON
@@ -539,6 +549,19 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const auto* pipeline = config.resolve_op_support(src0);
         if (!pipeline) continue;
 
+        if (trace_enabled()) {
+            std::call_once(trace_pipeline_once, [&]() {
+                fprintf(stderr,
+                        "RKNPU trace: tensor '%s' type=%d uses pipeline '%s' (k_align=%d, n_align=%d, hadamard=%d)\n",
+                        src0->name[0] ? src0->name : "<unnamed>",
+                        (int) src0->type,
+                        pipeline->pipeline_name.c_str(),
+                        pipeline->k_align,
+                        pipeline->n_align,
+                        pipeline->use_hadamard ? 1 : 0);
+            });
+        }
+
         // Initializing Hadamard Transform Logic
         const bool is_hadamard = (pipeline->use_hadamard);
         const int K_op = is_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
@@ -789,6 +812,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         #pragma omp parallel for num_threads(num_active_segments)
         for (size_t idx = 0; idx < num_active_segments; idx++) {
             int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
+            if (trace_enabled()) {
+                std::call_once(trace_run_once, [ret]() {
+                    fprintf(stderr, "RKNPU trace: rknn_matmul_run returned %d\n", ret);
+                });
+            }
             if (ret != RKNN_SUCC) {
                 // Handle error
             }

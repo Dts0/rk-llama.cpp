@@ -495,12 +495,17 @@ First, follow the official LunarG instructions for the installation and setup of
 
 #### Using system packages
 
-On Debian / Ubuntu, you can install the required dependencies using:
+On Debian / Ubuntu, you can install the build dependencies using:
 ```sh
-sudo apt-get install libvulkan-dev glslc spirv-headers
+sudo apt-get install libvulkan-dev glslc spirv-headers vulkan-tools
 ```
 
 SPIRV-Headers (`spirv/unified1/spirv.hpp`) are required for the Vulkan backend and are **not** always pulled in by the Vulkan loader dev package alone. Other distros use names such as `spirv-headers` (Ubuntu / Debian / Arch), or `spirv-headers-devel` (Fedora / openSUSE). On Windows, the LunarG Vulkan SDK’s `Include` directory already contains these headers.
+
+For Mesa-based Linux systems, you also need a Vulkan ICD at runtime. On Debian / Ubuntu this is commonly provided by:
+```sh
+sudo apt-get install mesa-vulkan-drivers
+```
 
 #### Common steps
 
@@ -509,7 +514,14 @@ Second, after verifying that you have followed all of the SDK installation/setup
 vulkaninfo
 ```
 
-Then, assuming you have `cd` into your llama.cpp folder and there are no errors with running `vulkaninfo`, you can proceed to build llama.cpp using the CMake commands below:
+Do not stop at "the command runs". Confirm that `vulkaninfo` lists an actual Vulkan GPU in the `Devices` section. If it reports `llvmpipe` only, or `ggml_vulkan: No devices found.`, then the Vulkan loader is present but no usable GPU driver is available to llama.cpp.
+
+Some Mesa ARM drivers are still experimental. For example, `panvk` may refuse to enumerate by default and require:
+```bash
+PAN_I_WANT_A_BROKEN_VULKAN_DRIVER=1 vulkaninfo --summary
+```
+
+Then, assuming you have `cd` into your llama.cpp folder and `vulkaninfo` shows the Vulkan device you expect, you can proceed to build llama.cpp using the CMake commands below:
 ```bash
 cmake -B build -DGGML_VULKAN=1
 cmake --build build --config Release

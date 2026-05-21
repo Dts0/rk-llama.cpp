@@ -814,17 +814,19 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
 }
 
 // CPU: ACCEL -> GPU host -> CPU extra -> CPU
-static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host) {
+static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices, bool use_extra_bufts, bool no_host, bool allow_accel_bufts) {
     buft_list_t buft_list;
 
-    // add ACCEL buffer types
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-            auto * buft = ggml_backend_dev_buffer_type(dev);
-            // skip
-            if (buft != ggml_backend_cpu_buffer_type()) {
-                buft_list.emplace_back(dev, buft);
+    if (allow_accel_bufts) {
+        // add ACCEL buffer types
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                auto * buft = ggml_backend_dev_buffer_type(dev);
+                // skip
+                if (buft != ggml_backend_cpu_buffer_type()) {
+                    buft_list.emplace_back(dev, buft);
+                }
             }
         }
     }
@@ -1173,7 +1175,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    const bool allow_implicit_accel_bufts = params.devices == nullptr;
+
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host, allow_implicit_accel_bufts);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
