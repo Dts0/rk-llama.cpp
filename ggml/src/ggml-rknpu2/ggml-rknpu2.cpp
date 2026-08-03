@@ -372,6 +372,8 @@ struct rknpu_matmul_context {
 
     bool b_bound = false;
     std::shared_ptr<rknn_tensor_mem> mem_B;
+    rknn_tensor_mem * mem_A_bound = nullptr;
+    rknn_tensor_mem * mem_C_bound = nullptr;
 
     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, int32_t domain_id) {
         memset(&info, 0, sizeof(info));
@@ -608,9 +610,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             b_domain_id = it->second.iommu_domain_id;
         }
 
-        // Cleaning the C-matrix buffer
         float* dst_data = (float*)get_tensor_real_ptr(dst);
-        memset(dst_data, 0, (size_t)M * N * sizeof(float));
 
         // Acquiring the Hadamard vector
         std::vector<float> s_vec;
@@ -774,7 +774,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                 // Assigning A-matrix to all contexts for the parallel execution
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                    if (matmul_ctxs[idx]->mem_A_bound != mem_A_shared.get()) {
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                        matmul_ctxs[idx]->mem_A_bound = mem_A_shared.get();
+                    }
                 }
 
                 RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
@@ -797,7 +800,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
 
                     // Assigning C-matrix to current context for the parallel execution
-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                    if (matmul_ctx->mem_C_bound != mem_C_segments[idx].get()) {
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                        matmul_ctx->mem_C_bound = mem_C_segments[idx].get();
+                    }
                 }
             }
 
@@ -856,14 +862,22 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 int n = 0;
 #ifdef __ARM_NEON
                                 const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
-                                for (; n + 3 < N_segment; n += 4) {
-                                    float32x4_t s = vld1q_f32(src_ptr + n);
-                                    float32x4_t d = vld1q_f32(dst_ptr + n);
-                                    vst1q_f32(dst_ptr + n, vmlaq_f32(d, s, scale_vec));
+                                if (k_idx == 0) {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        vst1q_f32(dst_ptr + n, vmulq_f32(vld1q_f32(src_ptr + n), scale_vec));
+                                    }
+                                } else {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        float32x4_t s = vld1q_f32(src_ptr + n);
+                                        float32x4_t d = vld1q_f32(dst_ptr + n);
+                                        vst1q_f32(dst_ptr + n, vmlaq_f32(d, s, scale_vec));
+                                    }
                                 }
 #endif
-                                for (; n < N_segment; ++n) {
-                                    dst_ptr[n] += src_ptr[n] * dequant_scale;
+                                if (k_idx == 0) {
+                                    for (; n < N_segment; ++n) dst_ptr[n] = src_ptr[n] * dequant_scale;
+                                } else {
+                                    for (; n < N_segment; ++n) dst_ptr[n] += src_ptr[n] * dequant_scale;
                                 }
                             }
                             break;
@@ -882,15 +896,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 int n = 0;
 #ifdef __ARM_NEON
                                 const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
-                                for (; n + 3 < N_segment; n += 4) {
-                                    int32x4_t  s32 = vld1q_s32(src_ptr + n);
-                                    float32x4_t sf = vcvtq_f32_s32(s32);
-                                    float32x4_t df = vld1q_f32(dst_ptr + n);
-                                    vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                if (k_idx == 0) {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        int32x4_t s32 = vld1q_s32(src_ptr + n);
+                                        vst1q_f32(dst_ptr + n, vmulq_f32(vcvtq_f32_s32(s32), scale_vec));
+                                    }
+                                } else {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        int32x4_t s32 = vld1q_s32(src_ptr + n);
+                                        float32x4_t sf = vcvtq_f32_s32(s32);
+                                        float32x4_t df = vld1q_f32(dst_ptr + n);
+                                        vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                    }
                                 }
 #endif
-                                for (; n < N_segment; ++n) {
-                                    dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
+                                if (k_idx == 0) {
+                                    for (; n < N_segment; ++n) dst_ptr[n] = (float)src_ptr[n] * dequant_scale;
+                                } else {
+                                    for (; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
                                 }
                             }
                             break;
@@ -909,16 +932,25 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 int n = 0;
 #ifdef __ARM_NEON
                                 const float32x4_t scale_vec = vdupq_n_f32(dequant_scale);
-                                for (; n + 3 < N_segment; n += 4) {
-                                    int16x4_t s16 = vld1_s16(src_ptr + n);
-                                    int32x4_t s32 = vmovl_s16(s16);
-                                    float32x4_t sf = vcvtq_f32_s32(s32);
-                                    float32x4_t df = vld1q_f32(dst_ptr + n);
-                                    vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                if (k_idx == 0) {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        int16x4_t s16 = vld1_s16(src_ptr + n);
+                                        vst1q_f32(dst_ptr + n, vmulq_f32(vcvtq_f32_s32(vmovl_s16(s16)), scale_vec));
+                                    }
+                                } else {
+                                    for (; n + 3 < N_segment; n += 4) {
+                                        int16x4_t s16 = vld1_s16(src_ptr + n);
+                                        int32x4_t s32 = vmovl_s16(s16);
+                                        float32x4_t sf = vcvtq_f32_s32(s32);
+                                        float32x4_t df = vld1q_f32(dst_ptr + n);
+                                        vst1q_f32(dst_ptr + n, vmlaq_f32(df, sf, scale_vec));
+                                    }
                                 }
 #endif
-                                for (; n < N_segment; ++n) {
-                                    dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
+                                if (k_idx == 0) {
+                                    for (; n < N_segment; ++n) dst_ptr[n] = (float)src_ptr[n] * dequant_scale;
+                                } else {
+                                    for (; n < N_segment; ++n) dst_ptr[n] += (float)src_ptr[n] * dequant_scale;
                                 }
                             }
                             break;
@@ -1071,6 +1103,9 @@ static void dequantize_row(
     } else if (tensor->type == GGML_TYPE_Q4_0) {
         const block_q4_0* src = (const block_q4_0*)raw_data;
         dequantize_row_q4_0(src + (size_t)n * (K / QK4_0), row_out, K);
+    } else if (tensor->type == GGML_TYPE_Q4_K) {
+        const block_q4_K* src = (const block_q4_K*)raw_data;
+        dequantize_row_q4_K(src + (size_t)n * (K / QK_K), row_out, K);
     } else {
         GGML_ASSERT(false && "Unsupported weight type for NPU pipeline");
     }
@@ -1233,6 +1268,10 @@ static size_t pack_tensor_segment(
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
 
+    // Preserve the standard GGUF layout for zero-copy CPU fallback. The NPU
+    // native copy is allocated and packed separately below.
+    memcpy((uint8_t*)tensor->data + offset, data, size);
+
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* pipeline = config.resolve_op_support(tensor);
 
@@ -1253,7 +1292,6 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         // Skip NPU packing if the tensor is too small for NPU alignment
         if (required_size == 0) {
-            memcpy((uint8_t*)tensor->data + offset, data, size);
             return;
         }
 
@@ -1327,28 +1365,19 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
-    } else {
-        memcpy((uint8_t*)tensor->data + offset, data, size);
     }
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    auto * ctx = (ggml_backend_rknpu_buffer_context*)buffer->context;
-    size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
-
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
-    if (it != ctx->tensor_allocs.end()) {
-        memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
-    } else {
-        memcpy(data, (uint8_t*)tensor->data + offset, size);
-    }
+    UNUSED(buffer);
+    memcpy(data, (uint8_t*)tensor->data + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
+    memset(ctx->virtual_base, value, ctx->total_size);
     for (auto& pair : ctx->tensor_allocs) {
         memset((uint8_t*)pair.second.mem->virt_addr, value, pair.second.size);
     }
@@ -1404,7 +1433,12 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
     size_t packed_size = get_tensor_packed_size(tensor);
-    return packed_size > 0 ? packed_size : ggml_nbytes(tensor);
+    return packed_size > 0 ? std::max(packed_size, ggml_nbytes(tensor)) : ggml_nbytes(tensor);
+}
+
+static bool ggml_backend_rknpu_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    UNUSED(buft);
+    return true;
 }
 
 
@@ -1441,7 +1475,7 @@ static void ggml_backend_rknpu_device_get_props(ggml_backend_dev_t dev, struct g
     props->device_id = NULL;
 
     props->caps.async = false;
-    props->caps.host_buffer = false;
+    props->caps.host_buffer = true;
     props->caps.buffer_from_host_ptr = false;
     props->caps.events = false;
 }
@@ -1474,6 +1508,12 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
             // Checking if activation type matches the supported operation
             if (src1->type != GGML_TYPE_F32) {
+                return false;
+            }
+
+            // Small Q4_K batches are faster on the CPU and can read the host
+            // copy directly, while larger prefill batches remain on the NPU.
+            if (src0->type == GGML_TYPE_Q4_K && src1->ne[1] <= 4) {
                 return false;
             }
 
@@ -1581,7 +1621,7 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .get_alignment  = */ ggml_backend_rknpu_buffer_type_get_alignment,
         /* .get_max_size   = */ NULL,
         /* .get_alloc_size = */ ggml_backend_rknpu_buffer_type_get_alloc_size,
-        /* .is_host        = */ NULL,
+        /* .is_host        = */ ggml_backend_rknpu_buffer_type_is_host,
     };
 
     static struct ggml_backend_buffer_type rknpu_buffer_type = {
