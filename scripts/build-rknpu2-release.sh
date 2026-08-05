@@ -204,7 +204,9 @@ Usage:
 
 Environment overrides:
   MODEL, RKNPU_DEVICE, HOST, PORT, THREADS, THREADS_BATCH,
-  PARALLEL, CTX_SIZE, CACHE_RAM, BATCH_SIZE, UBATCH_SIZE
+  PARALLEL, CTX_SIZE, CACHE_RAM, BATCH_SIZE, UBATCH_SIZE,
+  RKNPU_WEIGHT_CACHE, RKNPU_WEIGHT_CACHE_DIR, RKNPU_WEIGHT_CACHE_REBUILD,
+  RKNPU_EXECUTION_PLAN_CACHE
 
 Examples:
   ./start.sh
@@ -233,6 +235,10 @@ detect_rknpu_device() {
 
 export LD_LIBRARY_PATH="${ROOT_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export RKNPU_DEVICE="${RKNPU_DEVICE:-$(detect_rknpu_device)}"
+cache_home="${XDG_CACHE_HOME:-${HOME:-${ROOT_DIR}}/.cache}"
+export RKNPU_WEIGHT_CACHE="${RKNPU_WEIGHT_CACHE:-1}"
+export RKNPU_WEIGHT_CACHE_DIR="${RKNPU_WEIGHT_CACHE_DIR:-${cache_home}/rk-llama.cpp/rknpu2-weights}"
+export RKNPU_EXECUTION_PLAN_CACHE="${RKNPU_EXECUTION_PLAN_CACHE:-1}"
 
 case "${RKNPU_DEVICE}" in
     RK3576|RK3588) ;;
@@ -264,8 +270,8 @@ threads_batch="${THREADS_BATCH:-8}"
 parallel="${PARALLEL:-2}"
 ctx_size="${CTX_SIZE:-32000}"
 cache_ram="${CACHE_RAM:-2048}"
-batch_size="${BATCH_SIZE:-512}"
-ubatch_size="${UBATCH_SIZE:-512}"
+batch_size="${BATCH_SIZE:-1024}"
+ubatch_size="${UBATCH_SIZE:-256}"
 
 printf 'Starting llama-server: device=%s model=%s listen=%s:%s\n' \
     "${RKNPU_DEVICE}" "${model}" "${host}" "${port}"
@@ -332,6 +338,16 @@ Additional arguments are appended to the \`llama-server\` command:
 \`\`\`sh
 ./start.sh /path/to/model.gguf --api-key secret
 \`\`\`
+
+The release start script enables the native weight cache and execution plan cache by default. Native weights are stored under \`\${XDG_CACHE_HOME:-\${HOME}/.cache}/rk-llama.cpp/rknpu2-weights\`. Allow approximately one native-format copy of the model weights.
+
+Set a different writable directory when needed:
+
+\`\`\`sh
+RKNPU_WEIGHT_CACHE_DIR=/path/to/cache ./start.sh /path/to/model.gguf
+\`\`\`
+
+Set \`RKNPU_WEIGHT_CACHE=0\` or \`RKNPU_EXECUTION_PLAN_CACHE=0\` to disable either cache. Set \`RKNPU_WEIGHT_CACHE_REBUILD=1\` for one run to replace the weight entries used by that process. Weight cache entries are validated against the model content, SoC and RKNN runtime configuration before use.
 
 The server listens on \`0.0.0.0:8080\` by default. This build does not include
 the embedded Web UI; use the HTTP/OpenAI-compatible API endpoints.
