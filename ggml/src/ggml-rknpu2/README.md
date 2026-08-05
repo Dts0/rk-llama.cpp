@@ -144,6 +144,22 @@ Because of this double conversion process, you must carefully pair your input GG
 3. **Terrible Case (GGUF Precision < NPU Precision)**<br>
    Upscaling a `Q4_0` model to run on an `FP16` or `INT8` NPU pipeline. Information was irreversibly lost when the model was originally compressed to `Q4_0`. Requantizing it to a higher bit-depth cannot restore the lost accuracy, meaning you will get the poor quality of a 4-bit model while wasting the memory bandwidth and compute resources of an 8-bit or 16-bit model.
 
+### Native Weight Cache
+
+The native weight cache is disabled by default. Set `RKNPU_WEIGHT_CACHE=1` and `RKNPU_WEIGHT_CACHE_DIR` to store the packed result and reuse it on later starts. This avoids repeating the GGUF dequantization, NPU requantization, and native packing steps:
+
+```sh
+RKNPU_DEVICE="RK3576" RKNPU_WEIGHT_CACHE=1 RKNPU_WEIGHT_CACHE_DIR="/path/to/cache" ./build/bin/llama-server -m ./model.gguf
+```
+
+Allow enough free disk space for approximately one copy of the model weights in the selected NPU pipeline format. Cache entries are specific to the source tensor content, SoC configuration, active cores, pipeline layout, and RKNN runtime version. A mismatch or failed integrity check causes the entry to be rebuilt from the GGUF weights.
+
+Set `RKNPU_WEIGHT_CACHE_REBUILD=1` for one run to replace all entries used by that process. Set `RKNPU_TRACE=1` to print cache hits, misses, invalid entries, and stores.
+
+### Execution Plan Cache
+
+The execution plan cache is disabled by default. Set `RKNPU_EXECUTION_PLAN_CACHE=1` to reuse the prepared combination of cached RKNN contexts and buffers, IO binding state, and matrix segmentation for each weight tensor and operation batch size. The cache uses process memory and is released when the backend is destroyed.
+
 ## Chipsets
 
 The backend configures operations based on hardware pipelines-specific hardware-accelerated paths mapping mathematical operations to native NPU types. Each supported chipset defines its own set of pipelines and default quantization behaviors.
