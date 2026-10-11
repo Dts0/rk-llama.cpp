@@ -3698,21 +3698,25 @@ struct test_rms_norm : public test_case {
     const bool v; // whether a is a non-contiguous view
     const float eps;
     const bool inplace; // whether to do the operation inplace
+    const bool large_input;
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, v, eps, inplace);
+        return VARS_TO_STR6(type, ne, v, eps, inplace, large_input);
     }
 
     test_rms_norm(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
             bool v = false,
             float eps = 1e-6f,
-            bool inplace = false)
-        : type(type), ne(ne), v(v), eps(eps), inplace(inplace) {}
+            bool inplace = false,
+            bool large_input = false)
+        : type(type), ne(ne), v(v), eps(eps), inplace(inplace), large_input(large_input) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_param(a);
+        if (!large_input) {
+            ggml_set_param(a);
+        }
         ggml_set_name(a, "a");
 
         if (v) {
@@ -3733,8 +3737,21 @@ struct test_rms_norm : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            init_tensor_uniform(t, -10.f, 10.f);
+            // Keep each square finite while overflowing the F32 row sum.
+            init_tensor_uniform(t, large_input ? 5e18f : -10.f, large_input ? 1e19f : 10.f);
         }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (large_input) {
+            // The reference backend can share the same overflowing implementation.
+            for (size_t i = 0; i < n; i++) {
+                if (!(a[i] > 0.0f && b[i] > 0.0f)) {
+                    return 1.0;
+                }
+            }
+        }
+        return test_case::err(a, b, n);
     }
 
     float grad_eps() override {
@@ -10154,6 +10171,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+
+    for (int64_t n : { 64, 65 }) {
+        for (bool inplace : { false, true }) {
+            test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 2, 1, 1}, false, 1e-6f, inplace, true));
+        }
+    }
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));

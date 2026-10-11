@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 #include <cmath>
 
 // ggml_compute_forward_dup
@@ -4137,10 +4138,20 @@ static void ggml_compute_forward_rms_norm_f32(
                 const float * x = (float *) ((char *) src0->data + i01*nb01 + i02*nb02 + i03*nb03);
                 float * y = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
 
-                float sum = 0.0f;
-                ggml_vec_dot_f32(ne00, &sum, 0, x, 0, x, 0, 1);
+                float sum_f32 = 0.0f;
+                if (!params->use_ref && ne00 <= INT_MAX) {
+                    ggml_vec_dot_f32((int) ne00, &sum_f32, 0, x, 0, x, 0, 1);
+                }
 
-                const float mean = sum/ne00;
+                float mean = sum_f32/ne00;
+                if (params->use_ref || ne00 > INT_MAX || !std::isnormal(mean) || mean <= 0.0f) {
+                    // Divide before narrowing to avoid overflow in the F32 sum.
+                    ggml_float sum = 0.0;
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        sum += (ggml_float)(x[i00] * x[i00]);
+                    }
+                    mean = sum/ne00;
+                }
                 const float scale = 1.0f/sqrtf(mean + eps);
 
                 // if you hit this, likely you got an inf somewhere earlier
@@ -4155,8 +4166,15 @@ static void ggml_compute_forward_rms_norm_f32(
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
                         y[i00] = x[i00] * scale * w[i00];
                     }
+                } else if (params->use_ref && ne00 <= INT_MAX) {
+                    memcpy(y, x, ne00 * sizeof(float));
+                    ggml_vec_scale_f32(ne00, y, scale);
+                } else if (ne00 <= INT_MAX) {
+                    ggml_vec_mad1_f32((int) ne00, y, x, scale, 0.0f);
                 } else {
-                    ggml_vec_mad1_f32(ne00, y, x, scale, 0.0f);
+                    for (int64_t i00 = 0; i00 < ne00; i00++) {
+                        y[i00] = x[i00] * scale;
+                    }
                 }
             }
         }

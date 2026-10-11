@@ -12,8 +12,8 @@
 
 namespace {
 
-constexpr uint8_t CACHE_MAGIC[8] = { 'R', 'K', 'N', 'P', 'W', '0', '0', '1' };
-constexpr uint32_t CACHE_VERSION = 1;
+constexpr uint8_t CACHE_MAGIC[8] = { 'R', 'K', 'N', 'P', 'W', '0', '0', '2' };
+constexpr uint32_t CACHE_VERSION = 2;
 constexpr uint32_t CACHE_ENDIAN = 0x01020304;
 constexpr uint64_t HASH_SEED_LO = 0x243f6a8885a308d3ULL;
 constexpr uint64_t HASH_SEED_HI = 0x13198a2e03707344ULL;
@@ -29,6 +29,12 @@ struct CacheHeader {
     uint64_t packed_size;
     uint64_t scale_count;
     uint64_t sign_count;
+    uint64_t lowrank_u_count;
+    uint64_t lowrank_v_count;
+    uint64_t hadamard_sign_hash_lo;
+    uint64_t hadamard_sign_hash_hi;
+    int32_t scale_scheme;
+    int32_t seed_scheme;
     uint64_t source_hash_lo;
     uint64_t source_hash_hi;
     uint64_t key_hash_lo;
@@ -49,6 +55,7 @@ struct CacheHeader {
     int32_t n_align;
     int32_t effective_k;
     int32_t use_hadamard;
+    int32_t use_lowrank;
     uint32_t reserved[15];
 };
 
@@ -197,6 +204,11 @@ static rknpu2_weight_cache::Hash128 descriptor_hash(const rknpu2_weight_cache::D
     hash = hash_value(hash, descriptor.packed_size);
     hash = hash_value(hash, descriptor.scale_count);
     hash = hash_value(hash, descriptor.sign_count);
+    hash = hash_value(hash, descriptor.lowrank_u_count);
+    hash = hash_value(hash, descriptor.lowrank_v_count);
+    hash = hash_value(hash, descriptor.hadamard_sign_hash);
+    hash = hash_value(hash, descriptor.scale_scheme);
+    hash = hash_value(hash, descriptor.seed_scheme);
     hash = hash_string(hash, descriptor.tensor_name);
     hash = hash_value(hash, descriptor.tensor_type);
     hash = hash_append(hash, descriptor.ne.data(), descriptor.ne.size() * sizeof(descriptor.ne[0]));
@@ -214,7 +226,8 @@ static rknpu2_weight_cache::Hash128 descriptor_hash(const rknpu2_weight_cache::D
     hash = hash_value(hash, descriptor.k_align);
     hash = hash_value(hash, descriptor.n_align);
     hash = hash_value(hash, descriptor.effective_k);
-    return hash_value(hash, descriptor.use_hadamard);
+    hash = hash_value(hash, descriptor.use_hadamard);
+    return hash_value(hash, descriptor.use_lowrank);
 }
 
 static uint64_t runtime_hash(const std::string & runtime_version) {
@@ -243,7 +256,7 @@ static std::string cache_path(const rknpu2_weight_cache::Descriptor & descriptor
     return cache_config().directory + "/" + safe_tensor_name(descriptor.tensor_name) + suffix;
 }
 
-static bool add_size(uint64_t & total, uint64_t count, size_t element_size) {
+static bool add_size(uint64_t & total, uint64_t count, uint64_t element_size) {
     if (count > (std::numeric_limits<uint64_t>::max() - total) / element_size) {
         return false;
     }
@@ -258,11 +271,74 @@ static bool expected_file_size(const rknpu2_weight_cache::Descriptor & descripto
            add_size(result, descriptor.n_segments.size(), sizeof(rknpu2_weight_cache::SegmentN)) &&
            add_size(result, descriptor.scale_count, sizeof(float)) &&
            add_size(result, descriptor.sign_count, sizeof(float)) &&
-           add_size(result, descriptor.packed_size, sizeof(uint8_t));
+           add_size(result, descriptor.lowrank_u_count, sizeof(float)) &&
+           add_size(result, descriptor.lowrank_v_count, sizeof(float)) &&
+           add_size(result, descriptor.packed_size, sizeof(uint8_t)) &&
+           result <= std::numeric_limits<size_t>::max();
+}
+
+static bool descriptor_valid(const rknpu2_weight_cache::Descriptor & descriptor) {
+    using namespace rknpu2_weight_cache;
+    if (descriptor.ne[0] <= 0 || descriptor.ne[1] <= 0 || descriptor.packed_size == 0 ||
+        descriptor.active_cores.empty() || descriptor.k_segments.empty() || descriptor.n_segments.empty() ||
+        descriptor.active_cores.size() > UINT32_MAX || descriptor.k_segments.size() > UINT32_MAX || descriptor.n_segments.size() > UINT32_MAX ||
+        (descriptor.use_hadamard != 0 && descriptor.use_hadamard != 1) || (descriptor.use_lowrank != 0 && descriptor.use_lowrank != 1)) {
+        return false;
+    }
+
+    uint64_t k_total = 0;
+    for (const auto & segment : descriptor.k_segments) {
+        if (segment.size <= 0 || segment.offset < 0 || (uint64_t) segment.offset != k_total ||
+            !add_size(k_total, segment.size, 1)) {
+            return false;
+        }
+    }
+    uint64_t n_total = 0;
+    uint64_t active_n_count = 0;
+    for (const auto & segment : descriptor.n_segments) {
+        if (segment.size < 0 || segment.offset < 0 || (uint64_t) segment.offset != n_total ||
+            std::find(descriptor.active_cores.begin(), descriptor.active_cores.end(), segment.core) == descriptor.active_cores.end() ||
+            !add_size(n_total, segment.size, 1)) {
+            return false;
+        }
+        active_n_count += segment.size > 0;
+    }
+    if (n_total == 0 || n_total > (uint64_t) descriptor.ne[1]) {
+        return false;
+    }
+
+    if (descriptor.use_hadamard) {
+        if (descriptor.seed_scheme != SEED_TENSOR_NAME_STD_HASH_MT19937 || descriptor.sign_count != k_total ||
+            k_total < (uint64_t) descriptor.ne[0] || (k_total & (k_total - 1)) != 0) {
+            return false;
+        }
+    } else if (descriptor.seed_scheme != SEED_NONE || descriptor.sign_count != 0 ||
+               descriptor.hadamard_sign_hash.lo != 0 || descriptor.hadamard_sign_hash.hi != 0 || k_total != (uint64_t) descriptor.ne[0]) {
+        return false;
+    }
+
+    uint64_t scale_count = 0;
+    uint64_t u_count = 0;
+    uint64_t v_count = 0;
+    if (descriptor.use_lowrank) {
+        if (descriptor.scale_scheme != SCALE_LOWRANK ||
+            !add_size(u_count, descriptor.k_segments.size(), n_total) ||
+            !add_size(v_count, active_n_count, k_total)) {
+            return false;
+        }
+    } else if (descriptor.scale_scheme == SCALE_PER_CHANNEL_ABSMAX) {
+        if (!add_size(scale_count, descriptor.k_segments.size(), descriptor.ne[1])) {
+            return false;
+        }
+    } else if (descriptor.scale_scheme != SCALE_NONE) {
+        return false;
+    }
+    return descriptor.scale_count == scale_count && descriptor.lowrank_u_count == u_count && descriptor.lowrank_v_count == v_count;
 }
 
 static rknpu2_weight_cache::Hash128 payload_hash(const rknpu2_weight_cache::Descriptor & descriptor, const std::vector<float> & scales,
-                                                 const std::vector<float> & signs, const uint8_t * packed_data) {
+                                                 const std::vector<float> & signs, const std::vector<float> & lowrank_u,
+                                                 const std::vector<float> & lowrank_v, const uint8_t * packed_data) {
     using namespace rknpu2_weight_cache;
     Hash128 hash = { HASH_SEED_LO, HASH_SEED_HI };
     hash = hash_vector(hash, descriptor.active_cores);
@@ -270,6 +346,8 @@ static rknpu2_weight_cache::Hash128 payload_hash(const rknpu2_weight_cache::Desc
     hash = hash_vector(hash, descriptor.n_segments);
     hash = hash_vector(hash, scales);
     hash = hash_vector(hash, signs);
+    hash = hash_vector(hash, lowrank_u);
+    hash = hash_vector(hash, lowrank_v);
     return hash_append(hash, packed_data, descriptor.packed_size);
 }
 
@@ -286,6 +364,12 @@ static CacheHeader make_header(const rknpu2_weight_cache::Descriptor & descripto
     header.packed_size = descriptor.packed_size;
     header.scale_count = descriptor.scale_count;
     header.sign_count = descriptor.sign_count;
+    header.lowrank_u_count = descriptor.lowrank_u_count;
+    header.lowrank_v_count = descriptor.lowrank_v_count;
+    header.hadamard_sign_hash_lo = descriptor.hadamard_sign_hash.lo;
+    header.hadamard_sign_hash_hi = descriptor.hadamard_sign_hash.hi;
+    header.scale_scheme = descriptor.scale_scheme;
+    header.seed_scheme = descriptor.seed_scheme;
     header.source_hash_lo = descriptor.source_hash.lo;
     header.source_hash_hi = descriptor.source_hash.hi;
     header.key_hash_lo = key_hash.lo;
@@ -306,6 +390,7 @@ static CacheHeader make_header(const rknpu2_weight_cache::Descriptor & descripto
     header.n_align = descriptor.n_align;
     header.effective_k = descriptor.effective_k;
     header.use_hadamard = descriptor.use_hadamard;
+    header.use_lowrank = descriptor.use_lowrank;
     return header;
 }
 
@@ -316,6 +401,9 @@ static bool header_matches(const CacheHeader & header, const rknpu2_weight_cache
            header.tensor_type == (uint32_t) descriptor.tensor_type && memcmp(header.ne, descriptor.ne.data(), sizeof(header.ne)) == 0 &&
            header.source_size == descriptor.source_size && header.packed_size == descriptor.packed_size &&
            header.scale_count == descriptor.scale_count && header.sign_count == descriptor.sign_count &&
+           header.lowrank_u_count == descriptor.lowrank_u_count && header.lowrank_v_count == descriptor.lowrank_v_count &&
+           header.hadamard_sign_hash_lo == descriptor.hadamard_sign_hash.lo && header.hadamard_sign_hash_hi == descriptor.hadamard_sign_hash.hi &&
+           header.scale_scheme == descriptor.scale_scheme && header.seed_scheme == descriptor.seed_scheme &&
            header.source_hash_lo == descriptor.source_hash.lo && header.source_hash_hi == descriptor.source_hash.hi &&
            header.key_hash_lo == key_hash.lo && header.key_hash_hi == key_hash.hi && header.file_size == file_size &&
            header.runtime_hash == runtime_hash(descriptor.runtime_version) &&
@@ -324,7 +412,8 @@ static bool header_matches(const CacheHeader & header, const rknpu2_weight_cache
            header.npu_type_a == descriptor.npu_type_a && header.npu_type_b == descriptor.npu_type_b &&
            header.npu_type_c == descriptor.npu_type_c && header.matmul_type == descriptor.matmul_type &&
            header.k_align == descriptor.k_align && header.n_align == descriptor.n_align &&
-           header.effective_k == descriptor.effective_k && header.use_hadamard == descriptor.use_hadamard;
+           header.effective_k == descriptor.effective_k && header.use_hadamard == descriptor.use_hadamard &&
+           header.use_lowrank == descriptor.use_lowrank;
 }
 
 static bool read_full(int fd, void * data, size_t size) {
@@ -386,14 +475,15 @@ Hash128 hash_source(const void * data, size_t size) {
     return hash_bytes(data, size, { HASH_SEED_LO, HASH_SEED_HI });
 }
 
-bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<float> & scales, std::vector<float> & signs) {
-    if (!enabled() || rebuild_requested()) {
+bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<float> & scales, std::vector<float> & signs,
+          std::vector<float> & lowrank_u, std::vector<float> & lowrank_v) {
+    if (!enabled() || rebuild_requested() || packed_data == nullptr || !descriptor_valid(descriptor)) {
         return false;
     }
 
     const Hash128 key_hash = descriptor_hash(descriptor);
     const std::string path = cache_path(descriptor, key_hash);
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         trace_result("miss", path);
         return false;
@@ -402,22 +492,26 @@ bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<floa
     uint64_t file_size;
     struct stat st;
     CacheHeader header;
-    bool valid = expected_file_size(descriptor, file_size) && fstat(fd, &st) == 0 && st.st_size >= 0 &&
+    bool valid = expected_file_size(descriptor, file_size) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
                  (uint64_t) st.st_size == file_size && read_full(fd, &header, sizeof(header)) &&
                  header_matches(header, descriptor, key_hash, file_size);
 
     std::vector<int32_t> cores(descriptor.active_cores.size());
     std::vector<SegmentK> k_segments(descriptor.k_segments.size());
     std::vector<SegmentN> n_segments(descriptor.n_segments.size());
-    scales.resize(valid ? descriptor.scale_count : 0);
-    signs.resize(valid ? descriptor.sign_count : 0);
+    std::vector<float> loaded_scales(valid ? descriptor.scale_count : 0);
+    std::vector<float> loaded_signs(valid ? descriptor.sign_count : 0);
+    std::vector<float> loaded_u(valid ? descriptor.lowrank_u_count : 0);
+    std::vector<float> loaded_v(valid ? descriptor.lowrank_v_count : 0);
 
     if (valid) valid = read_full(fd, cores.data(), cores.size() * sizeof(cores[0]));
     if (valid) valid = read_full(fd, k_segments.data(), k_segments.size() * sizeof(k_segments[0]));
     if (valid) valid = read_full(fd, n_segments.data(), n_segments.size() * sizeof(n_segments[0]));
     if (valid) valid = vectors_equal(cores, descriptor.active_cores) && vectors_equal(k_segments, descriptor.k_segments) && vectors_equal(n_segments, descriptor.n_segments);
-    if (valid) valid = read_full(fd, scales.data(), scales.size() * sizeof(scales[0]));
-    if (valid) valid = read_full(fd, signs.data(), signs.size() * sizeof(signs[0]));
+    if (valid) valid = read_full(fd, loaded_scales.data(), loaded_scales.size() * sizeof(loaded_scales[0]));
+    if (valid) valid = read_full(fd, loaded_signs.data(), loaded_signs.size() * sizeof(loaded_signs[0]));
+    if (valid) valid = read_full(fd, loaded_u.data(), loaded_u.size() * sizeof(loaded_u[0]));
+    if (valid) valid = read_full(fd, loaded_v.data(), loaded_v.size() * sizeof(loaded_v[0]));
     if (valid) valid = read_full(fd, packed_data, descriptor.packed_size);
 
     if (close(fd) != 0) {
@@ -425,24 +519,40 @@ bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<floa
     }
 
     if (valid) {
-        const Hash128 actual = payload_hash(descriptor, scales, signs, packed_data);
+        const Hash128 actual = payload_hash(descriptor, loaded_scales, loaded_signs, loaded_u, loaded_v, packed_data);
         valid = actual.lo == header.payload_hash_lo && actual.hi == header.payload_hash_hi;
+        if (valid && descriptor.use_hadamard) {
+            const Hash128 sign_hash = hash_source(loaded_signs.data(), loaded_signs.size() * sizeof(float));
+            valid = sign_hash.lo == descriptor.hadamard_sign_hash.lo && sign_hash.hi == descriptor.hadamard_sign_hash.hi;
+        }
     }
 
     if (!valid) {
-        scales.clear();
-        signs.clear();
         trace_result("invalid", path);
         return false;
     }
 
+    scales.swap(loaded_scales);
+    signs.swap(loaded_signs);
+    lowrank_u.swap(loaded_u);
+    lowrank_v.swap(loaded_v);
     trace_result("hit", path);
     return true;
 }
 
-void store(const Descriptor & descriptor, const uint8_t * packed_data, const std::vector<float> & scales, const std::vector<float> & signs) {
-    if (!enabled() || scales.size() != descriptor.scale_count || signs.size() != descriptor.sign_count) {
+void store(const Descriptor & descriptor, const uint8_t * packed_data, const std::vector<float> & scales, const std::vector<float> & signs,
+           const std::vector<float> & lowrank_u, const std::vector<float> & lowrank_v) {
+    if (!enabled() || packed_data == nullptr || !descriptor_valid(descriptor) ||
+        scales.size() != descriptor.scale_count || signs.size() != descriptor.sign_count ||
+        lowrank_u.size() != descriptor.lowrank_u_count || lowrank_v.size() != descriptor.lowrank_v_count) {
         return;
+    }
+
+    if (descriptor.use_hadamard) {
+        const Hash128 sign_hash = hash_source(signs.data(), signs.size() * sizeof(float));
+        if (sign_hash.lo != descriptor.hadamard_sign_hash.lo || sign_hash.hi != descriptor.hadamard_sign_hash.hi) {
+            return;
+        }
     }
 
     uint64_t file_size;
@@ -451,7 +561,7 @@ void store(const Descriptor & descriptor, const uint8_t * packed_data, const std
     }
 
     const Hash128 key_hash = descriptor_hash(descriptor);
-    const Hash128 data_hash = payload_hash(descriptor, scales, signs, packed_data);
+    const Hash128 data_hash = payload_hash(descriptor, scales, signs, lowrank_u, lowrank_v, packed_data);
     const CacheHeader header = make_header(descriptor, key_hash, data_hash, file_size);
     const std::string path = cache_path(descriptor, key_hash);
     std::string temporary = path + ".tmp.XXXXXX";
@@ -471,6 +581,8 @@ void store(const Descriptor & descriptor, const uint8_t * packed_data, const std
     if (valid) valid = write_full(fd, descriptor.n_segments.data(), descriptor.n_segments.size() * sizeof(descriptor.n_segments[0]));
     if (valid) valid = write_full(fd, scales.data(), scales.size() * sizeof(scales[0]));
     if (valid) valid = write_full(fd, signs.data(), signs.size() * sizeof(signs[0]));
+    if (valid) valid = write_full(fd, lowrank_u.data(), lowrank_u.size() * sizeof(lowrank_u[0]));
+    if (valid) valid = write_full(fd, lowrank_v.data(), lowrank_v.size() * sizeof(lowrank_v[0]));
     if (valid) valid = write_full(fd, packed_data, descriptor.packed_size);
     if (valid) valid = fdatasync(fd) == 0;
     if (close(fd) != 0) valid = false;

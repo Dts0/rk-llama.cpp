@@ -27,14 +27,14 @@ void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements);
 /**
  * @brief Symmetrically quantizes a row of FP32 values to INT8.
  *
- * The quantization formula is: `dst[i] = round(src[i] / scales[i])`.
+ * The quantization formula is: `dst[i] = clamp(round(src[i] / scales[i]), -127, 127)`.
  * The caller is responsible for calculating the appropriate scale
  * (e.g., `amax / 127.0f`).
  *
  * @param src Pointer to the source FP32 data.
  * @param dst Pointer to the destination INT8 data.
  * @param n_elements The number of elements to quantize.
- * @param scales Pointer to scale factors; if num_scales is 1, all elements use scales[0], otherwise scales[i] is indexed by element i.
+ * @param scales Pointer to scale factors; if num_scales is 1, all elements use scales[0], otherwise num_scales must equal n_elements and scales[i] is indexed by element i.
  * @param num_scales The number of scale factors.
  */
 void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, const float * scales, size_t num_scales);
@@ -42,7 +42,7 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, c
 /**
  * @brief Symmetrically quantizes a row of FP32 values to INT4 and packs them.
  *
- * The quantization formula is: `v = round(src[i] / scales[i])`.
+ * The quantization formula is: `v = clamp(round(src[i] / scales[i]), -7, 7)`.
  * Two INT4 values are packed into a single uint8_t.
  * The caller is responsible for calculating the appropriate scale
  * (e.g., `amax / 7.0f`).
@@ -50,7 +50,7 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, c
  * @param src Pointer to the source FP32 data.
  * @param dst Pointer to the destination packed INT4 (uint8_t) data.
  * @param n_elements The number of elements to quantize (must be a multiple of 2).
- * @param scales Pointer to scale factors; if num_scales is 1, all elements use scales[0], otherwise scales[i] is indexed by element i.
+ * @param scales Pointer to scale factors; if num_scales is 1, all elements use scales[0], otherwise num_scales must equal n_elements and scales[i] is indexed by element i.
  * @param num_scales The number of scale factors.
  */
 void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, const float * scales, size_t num_scales);

@@ -24,12 +24,28 @@ struct SegmentN {
     int32_t core = 0;
 };
 
+enum ScaleScheme : int32_t {
+    SCALE_NONE = 0,
+    SCALE_PER_CHANNEL_ABSMAX = 1,
+    SCALE_LOWRANK = 2,
+};
+
+enum SeedScheme : int32_t {
+    SEED_NONE = 0,
+    SEED_TENSOR_NAME_STD_HASH_MT19937 = 1,
+};
+
 struct Descriptor {
     Hash128 source_hash;
     uint64_t source_size = 0;
     uint64_t packed_size = 0;
     uint64_t scale_count = 0;
     uint64_t sign_count = 0;
+    uint64_t lowrank_u_count = 0;
+    uint64_t lowrank_v_count = 0;
+    Hash128 hadamard_sign_hash;
+    ScaleScheme scale_scheme = SCALE_NONE;
+    SeedScheme seed_scheme = SEED_NONE;
 
     std::string tensor_name;
     int32_t tensor_type = 0;
@@ -51,12 +67,17 @@ struct Descriptor {
     int32_t n_align = 0;
     int32_t effective_k = 0;
     int32_t use_hadamard = 0;
+    int32_t use_lowrank = 0;
 };
 
 bool enabled();
 bool rebuild_requested();
 Hash128 hash_source(const void * data, size_t size);
-bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<float> & scales, std::vector<float> & signs);
-void store(const Descriptor & descriptor, const uint8_t * packed_data, const std::vector<float> & scales, const std::vector<float> & signs);
+// Packed data may be changed on a miss; the caller must repack it.
+bool load(const Descriptor & descriptor, uint8_t * packed_data, std::vector<float> & scales, std::vector<float> & signs,
+          std::vector<float> & lowrank_u, std::vector<float> & lowrank_v);
+// Factors use k_idx * active_n_count + n_idx order, with N_seg u values and K_seg v values per segment.
+void store(const Descriptor & descriptor, const uint8_t * packed_data, const std::vector<float> & scales, const std::vector<float> & signs,
+           const std::vector<float> & lowrank_u, const std::vector<float> & lowrank_v);
 
 } // namespace rknpu2_weight_cache

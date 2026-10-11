@@ -349,6 +349,27 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT LLAMA_USE_SYSTEM_GGML)
+    set(RKNPU2_TEST_SOURCE_DIR ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rknpu2)
+    add_executable(test-rknpu2-quantization test-rknpu2-quantization.cpp
+        ${RKNPU2_TEST_SOURCE_DIR}/rknpu2-quantization.cpp)
+    target_link_libraries(test-rknpu2-quantization PRIVATE ggml-base)
+    add_executable(test-rknpu2-weight-cache test-rknpu2-weight-cache.cpp
+        ${RKNPU2_TEST_SOURCE_DIR}/rknpu2-weight-cache.cpp)
+
+    foreach(TEST_TARGET test-rknpu2-quantization test-rknpu2-weight-cache)
+        target_include_directories(${TEST_TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src
+            ${PROJECT_SOURCE_DIR}/ggml/include ${RKNPU2_TEST_SOURCE_DIR})
+        target_compile_features(${TEST_TARGET} PRIVATE cxx_std_17)
+        if (LLAMA_TESTS_INSTALL)
+            install(TARGETS ${TEST_TARGET} RUNTIME)
+        endif()
+        # Use the target name so CMake adds the cross-compiling emulator.
+        add_test(NAME ${TEST_TARGET} COMMAND ${TEST_TARGET})
+        set_property(TEST ${TEST_TARGET} PROPERTY LABELS "main;rknpu2")
+    endforeach()
+endif()
+
 if (NOT LLAMA_USE_SYSTEM_GGML)
     # Needs non-public ggml-impl.h
     llama_build_and_test(test-gguf.cpp)

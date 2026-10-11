@@ -301,7 +301,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W16A16_HADAMARD",
@@ -312,7 +313,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W8A8_STANDARD",
@@ -323,7 +325,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W8A8_HADAMARD",
@@ -334,7 +337,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 32,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W8A16_STANDARD",
@@ -345,7 +349,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W8A16_HADAMARD",
@@ -356,7 +361,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W4A4_STANDARD",
@@ -367,7 +373,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W4A4_HADAMARD",
@@ -378,7 +385,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W4A16_STANDARD",
@@ -389,7 +397,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ false
+            /* .use_hadamard  = */ false,
+            /* .use_lowrank   = */ false
         },
         {
             /* .pipeline_name = */ "W4A16_HADAMARD",
@@ -400,7 +409,8 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align       = */ 32,
             /* .n_align       = */ 16,
             /* .effective_k   = */ 0,
-            /* .use_hadamard  = */ true
+            /* .use_hadamard  = */ true,
+            /* .use_lowrank   = */ false
         }
     };
 

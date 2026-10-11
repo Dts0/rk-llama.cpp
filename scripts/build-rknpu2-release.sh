@@ -111,6 +111,7 @@ if [[ ${SKIP_BUILD} -eq 0 ]]; then
     printf 'Configuring release build: %s\n' "${BUILD_DIR}"
     cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DLLAMA_BUILD_COMMIT="${FULL_SHA}" \
         -DBUILD_SHARED_LIBS=ON \
         -DGGML_NATIVE=OFF \
         -DGGML_CPU_ARM_ARCH=armv8-a+crc+crypto \
@@ -141,9 +142,9 @@ file "${SERVER}" | grep -q 'ARM aarch64' || {
 
 VERSION_OUTPUT="$(LD_LIBRARY_PATH="${BUILD_BIN}:${ROOT_DIR}/ggml/src/ggml-rknpu2/libs${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
     "${SERVER}" --version 2>&1)"
-if [[ "${VERSION_OUTPUT}" != *"${SHORT_SHA}"* ]]; then
+if [[ "${VERSION_OUTPUT}" != *"${FULL_SHA}"* ]]; then
     printf '%s\n' 'The build does not match the current Git commit.' >&2
-    printf 'Expected SHA: %s\n' "${SHORT_SHA}" >&2
+    printf 'Expected SHA: %s\n' "${FULL_SHA}" >&2
     printf 'Version output: %s\n' "${VERSION_OUTPUT}" >&2
     exit 1
 fi
@@ -371,7 +372,7 @@ EOF
 
 PACKAGE_LD_LIBRARY_PATH="${PACKAGE_DIR}/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 PACKAGED_VERSION="$(LD_LIBRARY_PATH="${PACKAGE_LD_LIBRARY_PATH}" "${PACKAGE_DIR}/bin/llama-server" --version 2>&1)"
-[[ "${PACKAGED_VERSION}" == *"${SHORT_SHA}"* ]] || {
+[[ "${PACKAGED_VERSION}" == *"${FULL_SHA}"* ]] || {
     printf '%s\n' 'Packaged llama-server version verification failed.' >&2
     exit 1
 }

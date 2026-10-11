@@ -10,23 +10,22 @@ This project integrates Rockchip's Neural Processing Unit as a computational bac
 
 The primary motivation is to leverage the NPU as a powerful accelerator. This approach aims to achieve speedups over CPU-only inference while maintaining comparable accuracy with reduced power consumption.
 
-Currently, the backend is optimized and tested for the **RK3588** SoC. Support for other Rockchip SoCs can be added by updating the configuration file.
+The backend has configurations for **RK3588** and **RK3576**, including FP16 activation pipelines with INT8 or INT4 weights on RK3576. This integration branch still requires numerical and performance validation on Rockchip hardware.
 
 ## Quick start
 
 1. Clone the repository
 
 ```sh
-git clone https://github.com/invisiofficial/rk-llama.cpp
+git clone https://github.com/Dts0/rk-llama.cpp
 cd rk-llama.cpp
 ```
 
 2. Build the project
 
 ```sh
-mkdir build && cd build
-cmake .. -DLLAMA_RKNPU2=ON
-make -j4
+cmake -S . -B build -DGGML_RKNPU2=ON
+cmake --build build --parallel 4
 ```
 
 3. Run inference
@@ -35,15 +34,15 @@ make -j4
 # Set new max limit for open files
 ulimit -n 65536
 
-# Start chat with the model
-./build/bin/llama-cli -m ./gemma-3-1b-it-Q8_0.gguf
+# Run from the repository root
+./build/bin/llama completion -m ./gemma-3-1b-it-Q8_0.gguf
 ```
 
 ## Benchmarks
 
-The following benchmarks were conducted on an RK3588, comparing the performance, accuracy, and power consumption of the NPU backend against the standard CPU (NEON) backend.
+The following tables retain measurements from the [upstream RK3588 backend](https://github.com/invisiofficial/rk-llama.cpp/tree/rknpu2), comparing NPU inference against the CPU (NEON) backend.
 
-> **Note:** The results in the table below were obtained with an old version of this fork and may vary slightly from the current version. Use these for reference only. The **Chipsets** section below, however, contains up-to-date precision calculations.
+> **Note:** These are upstream reference measurements, not results from `rknpu2_merge_2610`. The pipeline precision tables in **Chipsets** are also upstream RK3588 reference data. They do not establish the accuracy, speed, or power consumption of this branch or RK3576.
 
 ### Dense Models
 
@@ -113,27 +112,35 @@ The following benchmarks were conducted on an RK3588, comparing the performance,
 
 Hybrid quantization is a technique designed to strike an optimal balance between memory consumption, inference speed, and generation quality.
 
-Instead of forcing the entire model into a single format, the backend processes the model layer by layer, cyclically applying a predefined sequence of hardware pipelines. This approach is entirely transparent and works with any input GGUF weight type. You can find the default pipeline sequences for each chip in the **Chipsets** section below.
+The backend assigns hardware pipelines cyclically to supported weight tensors. Supported GGUF weight types are `F16`, `Q8_0`, `Q6_K`, `Q4_0`, and `Q4_K`. You can find the default pipeline sequences for each chip in the **Chipsets** section below.
 
 ### Custom Patterns
 
-Building on this layer-by-layer approach, you can easily override the default behavior to experiment with your own quantization strategies.
+You can override the default tensor-to-pipeline mapping to experiment with quantization strategies.
 
-By setting the `RKNPU_HYBRID` environment variable, you define a custom sequence of hardware pipelines. The backend will cyclically iterate through this sequence as it loads the model's layers. For example, if you specify two pipelines, Layer 1 will use the first, Layer 2 will use the second, Layer 3 will revert to the first, and so on.
+By setting the `RKNPU_HYBRID` environment variable, you define a custom sequence of hardware pipelines for supported weight types. The backend cycles through the sequence as it first encounters each distinct weight tensor; several tensors can belong to one model layer. Pipeline names must be available on the selected chip.
 
 ```sh
-# Alternates model layers between FP16, INT8 and INT4 NPU pipelines
-# This pipeline results in (16 + 8 + 4) / 3 ≈ 9.3 BPW
-RKNPU_HYBRID="W16A16_STANDARD,W8A8_STANDARD,W4A4_HADAMARD" ./build/bin/llama-cli -m ./model.gguf
+# Alternate tensors between FP16, INT8 and INT4 NPU pipelines on RK3588
+RKNPU_HYBRID="W16A16_STANDARD,W8A8_STANDARD,W4A4_HADAMARD" ./build/bin/llama completion -m ./model.gguf
 
-# When the backend encounters a wrong pipeline name, it offloads layer to the default CPU backend
-# This pipeline will offload to the NPU around half of the model's layers
-RKNPU_HYBRID="CPU_STANDARD,W8A8_STANDARD" ./build/bin/llama-cli -m ./model.gguf
+# A pipeline name absent from the chip configuration selects CPU fallback
+RKNPU_HYBRID="CPU_STANDARD,W8A8_STANDARD" ./build/bin/llama completion -m ./model.gguf
+
+# Enable optional low-rank scale reconstruction on RK3588
+RKNPU_HYBRID="W8A8_LOWRANK,W4A4_HADAMARD_LOWRANK" ./build/bin/llama completion -m ./model.gguf
+
+# Use FP16 activations with INT4 weights on RK3576
+RKNPU_DEVICE="RK3576" RKNPU_HYBRID="W4A16_STANDARD" ./build/bin/llama completion -m ./model.gguf
 ```
 
 ### Weights Requantizations
 
-It is important to understand how weights are loaded into the NPU. The backend does not execute GGUF formats (like `Q4_0` or `Q8_0`) natively. Instead, input weights are first dequantized to `FP32` on the CPU, calibrated, and then requantized into the NPU's native hardware formats. 
+The backend does not execute GGUF formats (like `Q4_0` or `Q8_0`) natively. Instead, input weights are first dequantized to `FP32` on the CPU, calibrated, and then requantized into the NPU's native hardware formats.
+
+Standard and Hadamard integer weight pipelines use the upstream per-channel absolute-maximum calibration: each output row in each K segment has its own scale, `amax / 127` for INT8 or `amax / 7` for INT4. This replaces the earlier block scale and entropy calibration, including for `W4A16_STANDARD`. Optional `*_LOWRANK` pipelines use reconstructed per-element scales from the segment's `u` and `v` factors instead. LOWRANK pipelines are available on RK3588 but are not selected by the defaults in this branch.
+
+Unsupported tensor shapes and operations fall back to the CPU. `Q4_K` matrix operations with at most four activation rows also use the CPU, while eligible larger batches can use the NPU. The backend retains the original host weights for CPU fallback.
 
 Because of this double conversion process, you must carefully pair your input GGUF model with your target NPU pipelines:
 
@@ -154,21 +161,25 @@ The native weight cache is disabled by default. Set `RKNPU_WEIGHT_CACHE=1` and `
 RKNPU_DEVICE="RK3576" RKNPU_WEIGHT_CACHE=1 RKNPU_WEIGHT_CACHE_DIR="/path/to/cache" ./build/bin/llama-server -m ./model.gguf
 ```
 
-Allow enough free disk space for approximately one copy of the model weights in the selected NPU pipeline format. Cache entries are specific to the source tensor content, SoC configuration, active cores, pipeline layout, and RKNN runtime version. A mismatch or failed integrity check causes the entry to be rebuilt from the GGUF weights.
+Allow enough free disk space for the packed model weights in the selected NPU pipeline format plus scale metadata. Cache format **v2** stores the packed weights, per-channel scales or low-rank `u`/`v` factors, and Hadamard signs. Cache identity includes the source tensor content, SoC configuration, active cores, pipeline layout, scale scheme, Hadamard seed scheme and sign hash, and RKNN runtime version.
+
+Older cache formats are not reused. A cache miss, incompatible descriptor, or failed integrity check causes rebuilding from the original GGUF weights; there is no need to convert old cache files manually.
 
 Set `RKNPU_WEIGHT_CACHE_REBUILD=1` for one run to replace all entries used by that process. Set `RKNPU_TRACE=1` to print cache hits, misses, invalid entries, and stores.
 
 ### Execution Plan Cache
 
-The execution plan cache is disabled by default. Set `RKNPU_EXECUTION_PLAN_CACHE=1` to reuse the prepared combination of cached RKNN contexts and buffers, IO binding state, and matrix segmentation for each weight tensor and operation batch size. The cache uses process memory and is released when the backend is destroyed.
+With `--no-mmap`, the loader writes directly to host buffers. Each NPU weight tensor is prepared on its first NPU operation, using the same quantization and weight-cache path as regular loading.
+
+The execution plan cache is disabled by default. Set `RKNPU_EXECUTION_PLAN_CACHE=1` to reuse the prepared combination of cached RKNN contexts and buffers, IO binding state, matrix segmentation, scales, and low-rank factors for each weight tensor and operation batch size. A plan is invalidated when the weight tensor version or source buffer instance changes. The cache uses process memory and is released when the backend is destroyed.
 
 ## Chipsets
 
 The backend configures operations based on hardware pipelines-specific hardware-accelerated paths mapping mathematical operations to native NPU types. Each supported chipset defines its own set of pipelines and default quantization behaviors.
 
-Below is a comparison of all available hardware pipelines on all available chipsets. The **KL Divergence** metrics were measured on the `Gemma-3-1b-it` model to isolate the accuracy impact of the NPU's internal quantization algorithms.
+The tables below list the configured hardware pipelines and default mappings. All numerical accuracy values in this section are retained from upstream RK3588 measurements on `Gemma-3-1b-it`; neither this branch nor RK3576 has been measured here.
 
-All results were measured using the command below. Baseline logits were obtained from F16 weights using the CPU backend. The table below shows the default CPU backend precision calculations for comparison.
+Upstream used the command below and obtained baseline logits from F16 weights on the CPU backend. Its CPU precision measurements are retained for comparison.
 
 ```sh
 taskset -c 4-7 ./build/bin/llama-perplexity -m ./model.gguf -f ./wiki.test.raw -t 4 -b 512 --chunks 32 --kl-divergence-base ./model-logits.kld --kl-divergence
@@ -182,7 +193,9 @@ taskset -c 4-7 ./build/bin/llama-perplexity -m ./model.gguf -f ./wiki.test.raw -
 
 ### RK3588
 
-#### Available Pipelines
+The default configuration uses NPU cores 0, 1, and 2 and a maximum K segment size of 8192.
+
+#### Available Pipelines (Upstream Reference Measurements)
 
 | Name | Operation | Perplexity | KL-Divergence | Top-P | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -202,12 +215,44 @@ taskset -c 4-7 ./build/bin/llama-perplexity -m ./model.gguf -f ./wiki.test.raw -
 | Input Weight Type | Default Hardware Pipeline | Bits Per Weight |
 | :--- | :--- | :--- |
 | `F16` | [`W16A16_STANDARD`] | 16 |
-| `Q8_0` | [`W8A8_LOWRANK`] | 8 |
-| `Q6_K` | [`W8A8_LOWRANK`, `W4A4_HADAMARD_LOWRANK`] | 6 |
-| `Q4_0` | [`W4A4_HADAMARD_LOWRANK`] | 4 |
+| `Q8_0` | [`W8A8_STANDARD`] | 8 |
+| `Q6_K` | [`W8A8_STANDARD`, `W4A4_HADAMARD`] | 6 |
+| `Q4_0` | [`W4A4_HADAMARD`] | 4 |
+| `Q4_K` | [`W4A4_HADAMARD`] | 4 |
 
 \* **Hadamard Transform:** Applies a randomized Fast Walsh-Hadamard Transform to smooth out activation outliers before quantization (see [QuaRot](https://arxiv.org/abs/2404.00456)).</br>
-\*\* **Low-Rank Approximation:** Decomposes the per-element scale matrix into a rank-1 factorization to preserve GEMM compatibility and achieve fine-grained accuracy with near-zero overhead (see [LRSR](https://doi.org/10.5281/zenodo.22976487)).
+\*\* **Low-Rank Approximation:** Reconstructs per-element weight scales with rank-1 factors and compensates the activation and output matrices to preserve GEMM compatibility (see [LRSR](https://doi.org/10.5281/zenodo.22976487)). It can be selected with `RKNPU_HYBRID`.
+
+### RK3576
+
+The default configuration uses NPU cores 0 and 1 and a maximum K segment size of 4096. The mixed pipelines use FP16 activations with INT8 or INT4 weights and FP32 output. No RK3576 accuracy or performance measurements are supplied here.
+
+#### Available Pipelines
+
+Operation order is activations (A) x weights (B) -> output (C).
+
+| Name | Operation | Notes |
+| :--- | :--- | :--- |
+| `W16A16_STANDARD` | FP16 x FP16 -> FP32 | - |
+| `W16A16_HADAMARD` | FP16 x FP16 -> FP32 | Hadamard transform |
+| `W8A8_STANDARD` | INT8 x INT8 -> INT32 | - |
+| `W8A8_HADAMARD` | INT8 x INT8 -> INT32 | Hadamard transform |
+| `W8A16_STANDARD` | FP16 x INT8 -> FP32 | - |
+| `W8A16_HADAMARD` | FP16 x INT8 -> FP32 | Hadamard transform |
+| `W4A4_STANDARD` | INT4 x INT4 -> INT16 | - |
+| `W4A4_HADAMARD` | INT4 x INT4 -> INT16 | Hadamard transform |
+| `W4A16_STANDARD` | FP16 x INT4 -> FP32 | - |
+| `W4A16_HADAMARD` | FP16 x INT4 -> FP32 | Hadamard transform |
+
+#### Default Mappings
+
+| Input Weight Type | Default Hardware Pipeline | Bits Per Weight |
+| :--- | :--- | :--- |
+| `F16` | [`W16A16_STANDARD`] | 16 |
+| `Q8_0` | [`W8A16_STANDARD`] | 8 |
+| `Q6_K` | [`W8A16_STANDARD`, `W4A16_HADAMARD`] | 6 |
+| `Q4_0` | [`W4A16_HADAMARD`] | 4 |
+| `Q4_K` | [`W4A16_STANDARD`] | 4 |
 
 ## FAQ
 
@@ -216,7 +261,7 @@ By default, the backend targets the **RK3588**. If you are using a different chi
 
 ```sh
 # Select RK3576 configuration
-RKNPU_DEVICE="RK3576" ./build/bin/llama-cli -m ./model.gguf
+RKNPU_DEVICE="RK3576" ./build/bin/llama completion -m ./model.gguf
 ```
 
 ### Q: Can I limit inference to specific NPU cores?
@@ -224,10 +269,10 @@ The backend tries to utilize all available NPU cores. You can restrict execution
 
 ```sh
 # Use only the first core
-RKNPU_CORES="0" ./build/bin/llama-cli -m ./model.gguf
+RKNPU_CORES="0" ./build/bin/llama completion -m ./model.gguf
 
 # Use cores 0 and 2
-RKNPU_CORES="0,2" ./build/bin/llama-cli -m ./model.gguf
+RKNPU_CORES="0,2" ./build/bin/llama completion -m ./model.gguf
 ```
 
 ### Q: How can I run multiple model instances without memory conflicts?
@@ -235,10 +280,10 @@ The Rockchip NPU has a strict 4GB limit per IOMMU domain. To run multiple instan
 
 ```sh
 # Use domains 0, 1, 2 and 3 for the model
-RKNPU_DOMAINS="0-3" ./build/bin/llama-cli -m ./model.gguf
+RKNPU_DOMAINS="0-3" ./build/bin/llama completion -m ./model.gguf
 
 # Use domains 4, 5, 6, 7 and 9 for the model
-RKNPU_DOMAINS="4-7,9" ./build/bin/llama-cli -m ./model.gguf
+RKNPU_DOMAINS="4-7,9" ./build/bin/llama completion -m ./model.gguf
 ```
 
 > **Warning:** Due to library and driver limitations, assigning custom domains while running multiple independent processes will cause a **System Kernel Panic** if they attempt to access the NPU hardware simultaneously. This leads to a total **Operating System Freeze**. To run concurrent models, ensure that inference in independent processes is executed **sequentially**. Loaded models can safely idle for an indefinite amount of time.

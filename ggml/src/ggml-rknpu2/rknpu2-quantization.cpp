@@ -1,10 +1,23 @@
+#ifdef __ARM_NEON
 #include <arm_neon.h>
+#endif
 #include <cmath>
 #include <algorithm>
 
 #include "rknpu2-quantization.h"
 
 namespace rknpu2_quantization {
+
+static int32_t quantize_value(float value, int32_t limit) {
+    const float rounded = std::roundf(value);
+    if (rounded >= limit) {
+        return limit;
+    }
+    if (rounded <= -limit) {
+        return -limit;
+    }
+    return std::isnan(rounded) ? 0 : (int32_t)rounded;
+}
 
 // --- Conversion from FP32 ---
 
@@ -23,11 +36,27 @@ void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements) 
     }
 }
 
-void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale) {
+void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, const float * scales, size_t num_scales) {
+    GGML_ASSERT(num_scales == 1 || num_scales == n_elements);
+    if (n_elements == 0) {
+        return;
+    }
+    GGML_ASSERT(scales != nullptr);
+    if (num_scales != 1) {
+        for (size_t i = 0; i < n_elements; ++i) {
+            const float scale = scales[i];
+            const float iscale = (scale == 0.0f || std::abs(scale) < 1e-9f) ? 0.0f : 1.0f / scale;
+            dst[i] = (int8_t)quantize_value(src[i] * iscale, 127);
+        }
+        return;
+    }
+    const float scale = scales[0];
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
     size_t i = 0;
 #ifdef __ARM_NEON
     const float32x4_t iscale_vec = vdupq_n_f32(iscale);
+    const int32x4_t lo127 = vdupq_n_s32(-127);
+    const int32x4_t hi127 = vdupq_n_s32(127);
     for (; i + 15 < n_elements; i += 16) {
         float32x4_t f0 = vld1q_f32(src + i);
         float32x4_t f1 = vld1q_f32(src + i + 4);
@@ -37,10 +66,10 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, f
         f1 = vmulq_f32(f1, iscale_vec);
         f2 = vmulq_f32(f2, iscale_vec);
         f3 = vmulq_f32(f3, iscale_vec);
-        int32x4_t i0 = vcvtaq_s32_f32(f0);
-        int32x4_t i1 = vcvtaq_s32_f32(f1);
-        int32x4_t i2 = vcvtaq_s32_f32(f2);
-        int32x4_t i3 = vcvtaq_s32_f32(f3);
+        int32x4_t i0 = vminq_s32(hi127, vmaxq_s32(lo127, vcvtaq_s32_f32(f0)));
+        int32x4_t i1 = vminq_s32(hi127, vmaxq_s32(lo127, vcvtaq_s32_f32(f1)));
+        int32x4_t i2 = vminq_s32(hi127, vmaxq_s32(lo127, vcvtaq_s32_f32(f2)));
+        int32x4_t i3 = vminq_s32(hi127, vmaxq_s32(lo127, vcvtaq_s32_f32(f3)));
         int16x8_t s01 = vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1));
         int16x8_t s23 = vcombine_s16(vqmovn_s32(i2), vqmovn_s32(i3));
         int8x16_t result = vcombine_s8(vqmovn_s16(s01), vqmovn_s16(s23));
@@ -48,11 +77,30 @@ void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, f
     }
 #endif
     for (; i < n_elements; ++i) {
-        dst[i] = (int8_t)roundf(src[i] * iscale);
+        dst[i] = (int8_t)quantize_value(src[i] * iscale, 127);
     }
 }
 
-void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, float scale) {
+void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_elements, const float * scales, size_t num_scales) {
+    GGML_ASSERT(n_elements % 2 == 0);
+    GGML_ASSERT(num_scales == 1 || num_scales == n_elements);
+    if (n_elements == 0) {
+        return;
+    }
+    GGML_ASSERT(scales != nullptr);
+    if (num_scales != 1) {
+        for (size_t i = 0; i < n_elements / 2; ++i) {
+            const float s0 = scales[i * 2 + 0];
+            const float s1 = scales[i * 2 + 1];
+            const float is0 = (s0 == 0.0f || std::abs(s0) < 1e-9f) ? 0.0f : 1.0f / s0;
+            const float is1 = (s1 == 0.0f || std::abs(s1) < 1e-9f) ? 0.0f : 1.0f / s1;
+            const int32_t v0_i = quantize_value(src[i * 2 + 0] * is0, 7);
+            const int32_t v1_i = quantize_value(src[i * 2 + 1] * is1, 7);
+            dst[i] = ((uint8_t)v0_i & 0x0F) | (((uint8_t)v1_i & 0x0F) << 4);
+        }
+        return;
+    }
+    const float scale = scales[0];
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
     size_t i_src = 0;
     size_t i_dst = 0;
@@ -88,9 +136,9 @@ void quantize_fp32_to_int4_packed(const float * src, uint8_t * dst, size_t n_ele
 #endif
     for (; i_src < n_elements; i_src += 2) {
         float v0 = src[i_src] * iscale;
-        float v1 = (i_src + 1 < n_elements) ? src[i_src + 1] * iscale : 0.0f;
-        int8_t v0_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v0)));
-        int8_t v1_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(v1)));
+        float v1 = src[i_src + 1] * iscale;
+        int32_t v0_i = quantize_value(v0, 7);
+        int32_t v1_i = quantize_value(v1, 7);
         dst[i_dst++] = ((uint8_t)v0_i & 0x0F) | (((uint8_t)v1_i & 0x0F) << 4);
     }
 }
