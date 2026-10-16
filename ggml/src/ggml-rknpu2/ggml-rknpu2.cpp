@@ -58,6 +58,10 @@ bool execution_plan_cache_enabled() {
 
 std::once_flag trace_pipeline_once;
 std::once_flag trace_run_once;
+std::once_flag trace_exact_once;
+std::once_flag trace_k256_once;
+std::once_flag trace_staged_once;
+std::once_flag trace_ffn_int4_once;
 } // namespace
 
 static float fp32_abs_max(const float * src, int n) {
@@ -360,6 +364,13 @@ struct ggml_backend_rknpu_buffer_context {
     // Per-channel scaling factors for each K segment of quantized weights
     std::unordered_map<const struct ggml_tensor *, std::vector<float>> quantized_tensor_scales;
 
+    // Per-channel zero points for exact per-block asymmetric INT4 weights
+    std::unordered_map<const struct ggml_tensor *, std::vector<float>> quantized_tensor_zeros;
+
+    // Q4_K K256 decomposition metadata: d per 256-element superblock and z per 32-element group.
+    std::unordered_map<const struct ggml_tensor *, std::vector<float>> q4k_k256_d;
+    std::unordered_map<const struct ggml_tensor *, std::vector<float>> q4k_k256_z;
+
     // Per-tensor random sign vector for Hadamard Transform
     std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
 
@@ -446,8 +457,18 @@ struct rknpu_matmul_context {
 struct rknpu_k_execution_plan {
     MatrixSegmentK k_segment;
     std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs;
+    std::vector<size_t> b_offsets;
+    std::vector<std::shared_ptr<rknn_tensor_mem>> mem_B_segments;
     std::vector<std::shared_ptr<rknn_tensor_mem>> mem_A_segments;
     std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments;
+
+    // Q4_K K256 secondary (INT4 high-part) plane.
+    std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs_hi;
+    std::vector<size_t> b_offsets_lo;
+    std::vector<size_t> b_offsets_hi;
+    std::vector<std::shared_ptr<rknn_tensor_mem>> mem_B_segments_hi;
+    std::vector<std::shared_ptr<rknn_tensor_mem>> mem_A_segments_hi;
+    std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments_hi;
 };
 
 struct rknpu_execution_plan {
@@ -460,6 +481,9 @@ struct rknpu_execution_plan {
     int K_op = 0;
     std::vector<MatrixSegmentN> active_n_segments;
     std::vector<float> scales_B_grid;
+    std::vector<float> zeros_B_grid;
+    std::vector<float> k256_d_grid;
+    std::vector<float> k256_z_grid;
     std::vector<float> hadamard_s_vector;
     std::vector<LowRankSegmentFactors> lowrank_factors;
     std::vector<rknpu_k_execution_plan> k_plans;
@@ -473,14 +497,34 @@ struct ggml_backend_rknpu_context {
     // RKNN matmul contexts cache (tensor_id, offset, M, K, N, core_id, type, domain_id, allocation_id)
     std::unordered_map<std::tuple<uintptr_t, size_t, int, int, int, int, int, int, uint64_t>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
 
+    // Shared matmul contexts for exact per-block INT4 (M, K, N, core_id, type, domain_id)
+    std::unordered_map<std::tuple<int, int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> shared_matmul_ctx_cache;
+
     // A-matrices cache (M, K, n_offset, npu_type_a, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> a_buffer_cache;
 
     // C-matrices cache (M, N, core_id, npu_type_c, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
 
+    // K256 A/C/B buffer caches. Keys include matmul type so LO/HI never alias.
+    std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> k256_a_buffer_cache;
+    std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> k256_c_buffer_cache;
+    std::unordered_map<std::tuple<uintptr_t, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> k256_b_buffer_cache;
+
+    // Shared stage-INT8 B scratch buffers (K_seg, N_seg, core, matmul_type, domain).
+    std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> staged_b_buffer_cache;
+
     // Prepared operation state (weight tensor, M)
     std::unordered_map<std::pair<uintptr_t, int>, std::shared_ptr<rknpu_execution_plan>, PairHasher> execution_plan_cache;
+
+    static rknn_core_mask core_mask_for(int core_id) {
+        switch (core_id) {
+            case 0: return RKNN_NPU_CORE_0;
+            case 1: return RKNN_NPU_CORE_1;
+            case 2: return RKNN_NPU_CORE_2;
+            default: return RKNN_NPU_CORE_AUTO;
+        }
+    }
 
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id, uint64_t allocation_id) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -496,20 +540,37 @@ struct ggml_backend_rknpu_context {
             return nullptr;
         }
 
-        rknn_core_mask core_mask;
-        switch(core_id) {
-            case 0: core_mask = RKNN_NPU_CORE_0; break;
-            case 1: core_mask = RKNN_NPU_CORE_1; break;
-            case 2: core_mask = RKNN_NPU_CORE_2; break;
-            default: core_mask = RKNN_NPU_CORE_AUTO; break;
-        }
-
-        int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
+        const rknn_core_mask core_mask = core_mask_for(core_id);
+        const int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
         if (ret != RKNN_SUCC) {
             // Handle error
         }
 
         matmul_ctx_cache[key] = ctx;
+        return ctx;
+    }
+
+    std::shared_ptr<rknpu_matmul_context> get_shared_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        auto key = std::make_tuple(M, K, N, core_id, (int) type, (int) domain_id);
+        auto it = shared_matmul_ctx_cache.find(key);
+        if (it != shared_matmul_ctx_cache.end()) {
+            return it->second;
+        }
+
+        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
+        if (ctx->ctx == 0) {
+            return nullptr;
+        }
+
+        const rknn_core_mask core_mask = core_mask_for(core_id);
+        const int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
+        if (ret != RKNN_SUCC) {
+            // Handle error
+        }
+
+        shared_matmul_ctx_cache[key] = ctx;
         return ctx;
     }
 };
@@ -566,9 +627,59 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     return mem_shared;
 }
 
+template <typename CacheKeyType>
+static std::shared_ptr<rknn_tensor_mem> get_fd_tensor_buffer(
+    ggml_backend_rknpu_context* backend_ctx,
+    rknn_matmul_ctx matmul_ctx,
+    int tensor_fd,
+    void * tensor_address,
+    size_t tensor_size,
+    size_t offset,
+    const CacheKeyType& key,
+    std::unordered_map<CacheKeyType, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
+) {
+    std::lock_guard<std::mutex> lock(backend_ctx->mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    rknn_tensor_mem * mem = rknn_create_mem_from_fd(matmul_ctx, tensor_fd, tensor_address, tensor_size, offset);
+    if (mem == nullptr) {
+        return nullptr;
+    }
+    auto deleter = [matmul_ctx](rknn_tensor_mem * value) {
+        if (value != nullptr) {
+            rknn_destroy_mem(matmul_ctx, value);
+        }
+    };
+    std::shared_ptr<rknn_tensor_mem> mem_shared(mem, deleter);
+    cache[key] = mem_shared;
+    return mem_shared;
+}
+
 static size_t get_tensor_packed_size(const struct ggml_tensor * tensor);
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                 const void * data, size_t offset, size_t size);
+static void stage_q4k_int8_segment(
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K, int N, int K_op,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg,
+    const std::vector<float> & scales_grid,
+    size_t k_idx,
+    rknn_tensor_mem * mem_B,
+    const rknpu2_configuration::Rknpu2HardwarePipeline * pipeline);
+static void stage_q4k_int8_segment_fused(
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K, int N,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg,
+    const std::vector<float> & scales_grid,
+    size_t k_idx,
+    rknn_tensor_mem * mem_B);
 
 static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
     ggml_backend_rknpu_context * backend_ctx,
@@ -638,13 +749,21 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
     }
 
     auto * buffer_ctx = source_buffer_ctx;
-    const size_t tensor_offset = (uintptr_t) src0->data - (uintptr_t) buffer_ctx->virtual_base;
+    const bool staged_q4k = pipeline->use_q4k_staged_int8 && src0->type == GGML_TYPE_Q4_K;
     int tensor_fd = -1;
     int32_t domain_id = 0;
     void * tensor_address = nullptr;
     size_t tensor_size = 0;
     uint64_t allocation_id = 0;
-    {
+    if (staged_q4k) {
+        tensor_address = src0->data;
+        tensor_size = ggml_nbytes(src0);
+        std::lock_guard<std::mutex> lock(buffer_ctx->mutex);
+        auto scales = buffer_ctx->quantized_tensor_scales.find(src0);
+        GGML_ASSERT(scales != buffer_ctx->quantized_tensor_scales.end() && "Staged INT8 scales not found");
+        plan->scales_B_grid = scales->second;
+    } else {
+        const size_t tensor_offset = (uintptr_t) src0->data - (uintptr_t) buffer_ctx->virtual_base;
         std::lock_guard<std::mutex> lock(buffer_ctx->mutex);
         auto allocation = buffer_ctx->tensor_allocs.find(tensor_offset);
         GGML_ASSERT(allocation != buffer_ctx->tensor_allocs.end() && "B-matrix RKNN buffer not found");
@@ -659,10 +778,24 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
             GGML_ASSERT(signs != buffer_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
             plan->hadamard_s_vector = signs->second;
         }
-        if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) {
+        if (!pipeline->use_q4k_k256 &&
+            (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 || pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4)) {
             auto scales = buffer_ctx->quantized_tensor_scales.find(src0);
             GGML_ASSERT(scales != buffer_ctx->quantized_tensor_scales.end() && "Quantized scales grid not found");
             plan->scales_B_grid = scales->second;
+        }
+        if (pipeline->use_q4k_block32_asym) {
+            auto zeros = buffer_ctx->quantized_tensor_zeros.find(src0);
+            GGML_ASSERT(zeros != buffer_ctx->quantized_tensor_zeros.end() && "Asymmetric zero grid not found");
+            plan->zeros_B_grid = zeros->second;
+        }
+        if (pipeline->use_q4k_k256) {
+            auto d_grid = buffer_ctx->q4k_k256_d.find(src0);
+            auto z_grid = buffer_ctx->q4k_k256_z.find(src0);
+            GGML_ASSERT(d_grid != buffer_ctx->q4k_k256_d.end() && "K256 d grid not found");
+            GGML_ASSERT(z_grid != buffer_ctx->q4k_k256_z.end() && "K256 z grid not found");
+            plan->k256_d_grid = d_grid->second;
+            plan->k256_z_grid = z_grid->second;
         }
         if (pipeline->use_lowrank) {
             auto factors = buffer_ctx->lowrank_segment_factors.find(src0);
@@ -671,18 +804,150 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
         }
     }
 
+    if (pipeline->use_q4k_k256) {
+        plan->k_plans.reserve(k_segments.size());
+        for (const auto & k_segment : k_segments) {
+            GGML_ASSERT(k_segment.size_k % 256 == 0);
+            rknpu_k_execution_plan k_plan;
+            k_plan.k_segment = k_segment;
+            const int sb_count = k_segment.size_k / 256;
+            k_plan.matmul_ctxs.reserve(plan->active_n_segments.size());
+            k_plan.matmul_ctxs_hi.reserve(plan->active_n_segments.size());
+            k_plan.mem_B_segments.reserve(plan->active_n_segments.size());
+            k_plan.mem_B_segments_hi.reserve(plan->active_n_segments.size());
+            k_plan.mem_A_segments.reserve(plan->active_n_segments.size());
+            k_plan.mem_A_segments_hi.reserve(plan->active_n_segments.size());
+            k_plan.mem_C_segments.reserve(plan->active_n_segments.size());
+            k_plan.mem_C_segments_hi.reserve(plan->active_n_segments.size());
+            k_plan.b_offsets_lo.reserve(plan->active_n_segments.size() * sb_count);
+            k_plan.b_offsets_hi.reserve(plan->active_n_segments.size() * sb_count);
+
+            for (const auto & n_segment : plan->active_n_segments) {
+                auto lo_ctx = backend_ctx->get_shared_matmul_ctx(
+                    M_op, 256, n_segment.size_n, n_segment.core_id,
+                    pipeline->mm_type, domain_id);
+                auto hi_ctx = backend_ctx->get_shared_matmul_ctx(
+                    M_op, 256, n_segment.size_n, n_segment.core_id,
+                    pipeline->mm_type_secondary, domain_id);
+                if (!lo_ctx || !hi_ctx || lo_ctx->ctx == 0 || hi_ctx->ctx == 0) {
+                    return nullptr;
+                }
+
+                auto b_key_lo = std::make_tuple((uintptr_t) tensor_address, n_segment.size_n,
+                                                 n_segment.core_id, (int) pipeline->mm_type, (int) domain_id);
+                auto b_key_hi = std::make_tuple((uintptr_t) tensor_address, n_segment.size_n,
+                                                 n_segment.core_id, (int) pipeline->mm_type_secondary, (int) domain_id);
+                auto lo_b = get_fd_tensor_buffer(backend_ctx, lo_ctx->ctx, tensor_fd, tensor_address,
+                                                 tensor_size, 0, b_key_lo, backend_ctx->k256_b_buffer_cache);
+                auto hi_b = get_fd_tensor_buffer(backend_ctx, hi_ctx->ctx, tensor_fd, tensor_address,
+                                                 tensor_size, 0, b_key_hi, backend_ctx->k256_b_buffer_cache);
+                if (!lo_b || !hi_b) {
+                    return nullptr;
+                }
+                lo_b->size = (uint32_t) n_segment.size_n * 256;
+                hi_b->size = (uint32_t) n_segment.size_n * 128;
+                RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, lo_b.get(), &lo_ctx->io_attr.B), "set K256 LO B segment");
+                RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, hi_b.get(), &hi_ctx->io_attr.B), "set K256 HI B segment");
+                k_plan.mem_B_segments.push_back(lo_b);
+                k_plan.mem_B_segments_hi.push_back(hi_b);
+
+                auto a_key_lo = std::make_tuple(M_op, n_segment.size_n, n_segment.core_id,
+                                                (int) pipeline->mm_type, (int) domain_id);
+                auto a_key_hi = std::make_tuple(M_op, n_segment.size_n, n_segment.core_id,
+                                                (int) pipeline->mm_type_secondary, (int) domain_id);
+                auto c_key_lo = a_key_lo;
+                auto c_key_hi = a_key_hi;
+                auto lo_a = get_tensor_buffer(backend_ctx, lo_ctx->ctx, lo_ctx->io_attr.A.size,
+                                              a_key_lo, backend_ctx->k256_a_buffer_cache);
+                auto hi_a = get_tensor_buffer(backend_ctx, hi_ctx->ctx, hi_ctx->io_attr.A.size,
+                                              a_key_hi, backend_ctx->k256_a_buffer_cache);
+                auto lo_c = get_tensor_buffer(backend_ctx, lo_ctx->ctx, lo_ctx->io_attr.C.size,
+                                              c_key_lo, backend_ctx->k256_c_buffer_cache);
+                auto hi_c = get_tensor_buffer(backend_ctx, hi_ctx->ctx, hi_ctx->io_attr.C.size,
+                                              c_key_hi, backend_ctx->k256_c_buffer_cache);
+                if (!lo_a || !hi_a || !lo_c || !hi_c) {
+                    return nullptr;
+                }
+                RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, lo_a.get(), &lo_ctx->io_attr.A), "set K256 LO A");
+                RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, hi_a.get(), &hi_ctx->io_attr.A), "set K256 HI A");
+                RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, lo_c.get(), &lo_ctx->io_attr.C), "set K256 LO C");
+                RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, hi_c.get(), &hi_ctx->io_attr.C), "set K256 HI C");
+                k_plan.matmul_ctxs.push_back(lo_ctx);
+                k_plan.matmul_ctxs_hi.push_back(hi_ctx);
+                k_plan.mem_A_segments.push_back(lo_a);
+                k_plan.mem_A_segments_hi.push_back(hi_a);
+                k_plan.mem_C_segments.push_back(lo_c);
+                k_plan.mem_C_segments_hi.push_back(hi_c);
+
+                for (int sb = 0; sb < sb_count; ++sb) {
+                    const size_t lo_off = (size_t) n_segment.offset_n * plan->K
+                        + (size_t) (k_segment.offset_k + sb * 256) * n_segment.size_n;
+                    const size_t hi_off = (size_t) plan->N * plan->K
+                        + (size_t) n_segment.offset_n * (plan->K / 2)
+                        + (size_t) (k_segment.offset_k + sb * 256) * (n_segment.size_n / 2);
+                    k_plan.b_offsets_lo.push_back(lo_off);
+                    k_plan.b_offsets_hi.push_back(hi_off);
+                }
+            }
+            plan->k_plans.push_back(std::move(k_plan));
+        }
+        return plan;
+    }
+
     size_t current_offset = 0;
+    const bool exact_q4k = pipeline->use_q4k_block32_asym;
+    std::vector<std::shared_ptr<rknn_tensor_mem>> shared_b_mems;
+    if (exact_q4k) {
+        shared_b_mems.reserve(plan->active_n_segments.size());
+        const int K_seg = k_segments.empty() ? 0 : k_segments[0].size_k;
+        for (const auto & n_segment : plan->active_n_segments) {
+            auto matmul_ctx = backend_ctx->get_shared_matmul_ctx(
+                M_op, K_seg, n_segment.size_n, n_segment.core_id, pipeline->mm_type, domain_id);
+            if (matmul_ctx == nullptr || matmul_ctx->ctx == 0) {
+                return nullptr;
+            }
+            rknn_tensor_mem * mem = rknn_create_mem_from_fd(
+                matmul_ctx->ctx, tensor_fd, tensor_address, tensor_size, 0);
+            if (mem == nullptr) {
+                return nullptr;
+            }
+            auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem * value) {
+                if (value != nullptr) {
+                    rknn_destroy_mem(ctx, value);
+                }
+            };
+            shared_b_mems.emplace_back(mem, deleter);
+        }
+    }
+
     plan->k_plans.reserve(k_segments.size());
     for (const auto & k_segment : k_segments) {
         rknpu_k_execution_plan k_plan;
         k_plan.k_segment = k_segment;
         k_plan.matmul_ctxs.reserve(plan->active_n_segments.size());
+        if (exact_q4k) {
+            k_plan.b_offsets.reserve(plan->active_n_segments.size());
+            k_plan.mem_B_segments = shared_b_mems;
+        } else if (staged_q4k) {
+            k_plan.mem_B_segments.reserve(plan->active_n_segments.size());
+        }
 
         for (const auto & n_segment : plan->active_n_segments) {
             const size_t offset = current_offset;
-            auto matmul_ctx = backend_ctx->get_matmul_ctx(
-                (uintptr_t) tensor_address, offset, M_op, k_segment.size_k, n_segment.size_n,
-                n_segment.core_id, pipeline->mm_type, domain_id, allocation_id);
+            std::shared_ptr<rknpu_matmul_context> matmul_ctx;
+            if (exact_q4k) {
+                matmul_ctx = backend_ctx->get_shared_matmul_ctx(
+                    M_op, k_segment.size_k, n_segment.size_n,
+                    n_segment.core_id, pipeline->mm_type, domain_id);
+            } else if (staged_q4k) {
+                matmul_ctx = backend_ctx->get_shared_matmul_ctx(
+                    M_op, k_segment.size_k, n_segment.size_n,
+                    n_segment.core_id, pipeline->mm_type, domain_id);
+            } else {
+                matmul_ctx = backend_ctx->get_matmul_ctx(
+                    (uintptr_t) tensor_address, offset, M_op, k_segment.size_k, n_segment.size_n,
+                    n_segment.core_id, pipeline->mm_type, domain_id, allocation_id);
+            }
             if (matmul_ctx == nullptr || matmul_ctx->ctx == 0) {
                 return nullptr;
             }
@@ -691,9 +956,26 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
             const size_t packed_bytes = pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16 ? elements * 2 :
                                         pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 ? elements : elements / 2;
             GGML_ASSERT(matmul_ctx->io_attr.B.size == packed_bytes);
-            GGML_ASSERT(offset <= tensor_size && packed_bytes <= tensor_size - offset);
+            if (!staged_q4k) {
+                GGML_ASSERT(offset <= tensor_size && packed_bytes <= tensor_size - offset);
+            }
 
-            if (!matmul_ctx->b_bound) {
+            if (exact_q4k) {
+                k_plan.b_offsets.push_back(offset);
+                const size_t mem_index = k_plan.b_offsets.size() - 1;
+                GGML_ASSERT(mem_index < k_plan.mem_B_segments.size());
+                k_plan.mem_B_segments[mem_index]->size = matmul_ctx->io_attr.B.size;
+            } else if (staged_q4k) {
+                auto b_key = std::make_tuple(k_segment.size_k, n_segment.size_n, n_segment.core_id,
+                                             (int) pipeline->mm_type, domain_id);
+                auto mem_B = get_tensor_buffer(backend_ctx, matmul_ctx->ctx, packed_bytes, b_key,
+                                               backend_ctx->staged_b_buffer_cache);
+                if (mem_B == nullptr) {
+                    return nullptr;
+                }
+                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B.get(), &matmul_ctx->io_attr.B), "set staged B segment");
+                k_plan.mem_B_segments.push_back(mem_B);
+            } else if (!matmul_ctx->b_bound) {
                 rknn_tensor_mem * mem = rknn_create_mem_from_fd(
                     matmul_ctx->ctx, tensor_fd, tensor_address, matmul_ctx->io_attr.B.size, offset);
                 if (mem == nullptr) {
@@ -709,7 +991,9 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
                 matmul_ctx->b_bound = true;
             }
 
-            current_offset += matmul_ctx->io_attr.B.size;
+            if (!staged_q4k) {
+                current_offset += matmul_ctx->io_attr.B.size;
+            }
             k_plan.matmul_ctxs.push_back(std::move(matmul_ctx));
         }
 
@@ -762,7 +1046,8 @@ static std::shared_ptr<rknpu_execution_plan> get_execution_plan(
 }
 
 template <typename T>
-static void collect_rknpu_row(const T * src, float * dst, int count, const float * weight_scales, float activation_scale, bool accumulate) {
+static void collect_rknpu_row(const T * src, float * dst, int count, const float * weight_scales,
+                              const float * weight_zeros, float activation_scale, float zero_sum, bool accumulate) {
     int n = 0;
 #ifdef __ARM_NEON
     const float32x4_t activation_vec = vdupq_n_f32(activation_scale);
@@ -776,12 +1061,18 @@ static void collect_rknpu_row(const T * src, float * dst, int count, const float
             values = vcvtq_f32_s32(vmovl_s16(vld1_s16(src + n)));
         }
         const float32x4_t scales = weight_scales ? vmulq_f32(vld1q_f32(weight_scales + n), activation_vec) : activation_vec;
-        const float32x4_t result = vmulq_f32(values, scales);
+        float32x4_t result = vmulq_f32(values, scales);
+        if (weight_zeros) {
+            result = vmlaq_n_f32(result, vld1q_f32(weight_zeros + n), zero_sum);
+        }
         vst1q_f32(dst + n, accumulate ? vaddq_f32(vld1q_f32(dst + n), result) : result);
     }
 #endif
     for (; n < count; ++n) {
-        const float result = (float) src[n] * (activation_scale * (weight_scales ? weight_scales[n] : 1.0f));
+        float result = (float) src[n] * (activation_scale * (weight_scales ? weight_scales[n] : 1.0f));
+        if (weight_zeros) {
+            result += weight_zeros[n] * zero_sum;
+        }
         if (accumulate) {
             dst[n] += result;
         } else {
@@ -834,6 +1125,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int K_op = plan->K_op;
         const auto & active_n_segments = plan->active_n_segments;
         const auto & scales_B_grid = plan->scales_B_grid;
+        const auto & zeros_B_grid = plan->zeros_B_grid;
         const auto & s_vec = plan->hadamard_s_vector;
         const size_t num_active_segments = active_n_segments.size();
         float * dst_data = (float *) get_tensor_real_ptr(dst);
@@ -849,6 +1141,45 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         pipeline->n_align,
                         pipeline->use_hadamard ? 1 : 0);
             });
+            if (pipeline->use_q4k_block32_asym) {
+                std::call_once(trace_exact_once, [&]() {
+                    fprintf(stderr,
+                            "RKNPU trace: tensor '%s' type=%d uses exact Q4_K per-32 asymmetric INT4 (k_align=%d, n_align=%d)\n",
+                            src0->name[0] ? src0->name : "<unnamed>",
+                            (int) src0->type,
+                            pipeline->k_align,
+                            pipeline->n_align);
+                });
+            }
+            if (pipeline->use_q4k_k256) {
+                std::call_once(trace_k256_once, [&]() {
+                    fprintf(stderr,
+                            "RKNPU trace: tensor '%s' type=%d uses W4A16_Q4K_K256 (k_align=%d, n_align=%d)\n",
+                            src0->name[0] ? src0->name : "<unnamed>",
+                            (int) src0->type,
+                            pipeline->k_align,
+                            pipeline->n_align);
+                });
+            }
+            if (pipeline->use_q4k_staged_int8) {
+                std::call_once(trace_staged_once, [&]() {
+                    fprintf(stderr,
+                            "RKNPU trace: tensor '%s' type=%d uses W4A16_Q4K_STAGED_INT8 (k_align=%d, n_align=%d)\n",
+                            src0->name[0] ? src0->name : "<unnamed>",
+                            (int) src0->type,
+                            pipeline->k_align,
+                            pipeline->n_align);
+                });
+            }
+            if (pipeline->use_hadamard && src0->type == GGML_TYPE_Q4_K) {
+                std::call_once(trace_ffn_int4_once, [&]() {
+                    fprintf(stderr,
+                            "RKNPU trace: tensor '%s' type=%d uses %s FFN INT4 hybrid\n",
+                            src0->name[0] ? src0->name : "<unnamed>",
+                            (int) src0->type,
+                            pipeline->pipeline_name.c_str());
+                });
+            }
         }
 
         for (size_t k_idx = 0; k_idx < plan->k_plans.size(); ++k_idx) {
@@ -863,6 +1194,112 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             const size_t num_a_matrices = mem_A_segments.size();
             auto & mem_C_segments = k_plan.mem_C_segments;
 
+            if (pipeline->use_q4k_k256) {
+                const int sb_count = K_seg_op / 256;
+                const int groups_per_sb = 8;
+                const float * x = (const float *) get_tensor_real_ptr(src1);
+                const int row_stride = (int) (src1->nb[1] / sizeof(float));
+
+                for (int sb = 0; sb < sb_count; ++sb) {
+                    const int k0 = k_seg.offset_k + sb * 256;
+                    std::vector<uint16_t> a_fp16((size_t) M * 256);
+                    #pragma omp parallel for
+                    for (int m = 0; m < M; ++m) {
+                        const float * src_row = x + (size_t) m * row_stride;
+                        rknpu2_quantization::convert_fp32_to_fp16(src_row + k0, a_fp16.data() + (size_t) m * 256, 256);
+                    }
+
+                    for (size_t i = 0; i < num_active_segments; ++i) {
+                        auto & lo_a = k_plan.mem_A_segments[i];
+                        auto & hi_a = k_plan.mem_A_segments_hi[i];
+                        memcpy(lo_a->virt_addr, a_fp16.data(), (size_t) M * 256 * sizeof(uint16_t));
+                        memcpy(hi_a->virt_addr, a_fp16.data(), (size_t) M * 256 * sizeof(uint16_t));
+                        if (M < M_op) {
+                            memset((uint8_t *) lo_a->virt_addr + (size_t) M * 256 * sizeof(uint16_t), 0,
+                                   (size_t) (M_op - M) * 256 * sizeof(uint16_t));
+                            memset((uint8_t *) hi_a->virt_addr + (size_t) M * 256 * sizeof(uint16_t), 0,
+                                   (size_t) (M_op - M) * 256 * sizeof(uint16_t));
+                        }
+                    }
+
+                    std::vector<float> sum_a((size_t) M * groups_per_sb, 0.0f);
+                    #pragma omp parallel for
+                    for (int m = 0; m < M; ++m) {
+                        for (int j = 0; j < groups_per_sb; ++j) {
+                            float sum = 0.0f;
+                            for (int l = 0; l < 32; ++l) {
+                                sum += ggml_fp16_to_fp32(a_fp16[(size_t) m * 256 + j * 32 + l]);
+                            }
+                            sum_a[(size_t) m * groups_per_sb + j] = sum;
+                        }
+                    }
+
+                    #pragma omp parallel for num_threads(num_active_segments)
+                    for (size_t i = 0; i < num_active_segments; ++i) {
+                        auto & lo_ctx = k_plan.matmul_ctxs[i];
+                        auto & hi_ctx = k_plan.matmul_ctxs_hi[i];
+                        auto & lo_b = k_plan.mem_B_segments[i];
+                        auto & hi_b = k_plan.mem_B_segments_hi[i];
+                        const auto & n_segment = active_n_segments[i];
+                        const size_t boff = (size_t) i * sb_count + sb;
+
+                        lo_b->offset = (int32_t) k_plan.b_offsets_lo[boff];
+                        lo_b->size = (uint32_t) n_segment.size_n * 256;
+                        hi_b->offset = (int32_t) k_plan.b_offsets_hi[boff];
+                        hi_b->size = (uint32_t) n_segment.size_n * 128;
+                        RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, lo_b.get(), &lo_ctx->io_attr.B), "set K256 LO B");
+                        RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, hi_b.get(), &hi_ctx->io_attr.B), "set K256 HI B");
+                        // Contexts are shared across K segments. Rebind A/C on every
+                        // segment so the last plan created cannot steal an earlier
+                        // segment's buffers.
+                        RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, k_plan.mem_A_segments[i].get(), &lo_ctx->io_attr.A), "set K256 LO A");
+                        RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, k_plan.mem_A_segments_hi[i].get(), &hi_ctx->io_attr.A), "set K256 HI A");
+                        RKNN_CHECK(rknn_matmul_set_io_mem(lo_ctx->ctx, k_plan.mem_C_segments[i].get(), &lo_ctx->io_attr.C), "set K256 LO C");
+                        RKNN_CHECK(rknn_matmul_set_io_mem(hi_ctx->ctx, k_plan.mem_C_segments_hi[i].get(), &hi_ctx->io_attr.C), "set K256 HI C");
+
+                        RKNN_CHECK(rknn_mem_sync(lo_ctx->ctx, k_plan.mem_A_segments[i].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync K256 LO A");
+                        RKNN_CHECK(rknn_mem_sync(hi_ctx->ctx, k_plan.mem_A_segments_hi[i].get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync K256 HI A");
+                        RKNN_CHECK(rknn_mem_sync(lo_ctx->ctx, lo_b.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync K256 LO B");
+                        RKNN_CHECK(rknn_mem_sync(hi_ctx->ctx, hi_b.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync K256 HI B");
+                        RKNN_CHECK(rknn_matmul_run(lo_ctx->ctx), "run K256 LO");
+                        RKNN_CHECK(rknn_matmul_run(hi_ctx->ctx), "run K256 HI");
+                        RKNN_CHECK(rknn_mem_sync(lo_ctx->ctx, k_plan.mem_C_segments[i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync K256 LO C");
+                        RKNN_CHECK(rknn_mem_sync(hi_ctx->ctx, k_plan.mem_C_segments_hi[i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync K256 HI C");
+                    }
+
+                    #pragma omp parallel for
+                    for (int m = 0; m < M; ++m) {
+                        for (size_t i = 0; i < num_active_segments; ++i) {
+                            const auto & n_segment = active_n_segments[i];
+                            const float * lo_c = (const float *) k_plan.mem_C_segments[i]->virt_addr;
+                            const float * hi_c = (const float *) k_plan.mem_C_segments_hi[i]->virt_addr;
+                            for (int n = 0; n < n_segment.size_n; ++n) {
+                                const int global_n = n_segment.offset_n + n;
+                                const int global_sb = k0 / 256;
+                                double zsum = 0.0;
+                                for (int j = 0; j < groups_per_sb; ++j) {
+                                    const int global_g = k0 / 32 + j;
+                                    zsum += (double) plan->k256_z_grid[(size_t) global_n * (K / 32) + global_g]
+                                          * (double) sum_a[(size_t) m * groups_per_sb + j];
+                                }
+                                const double d = plan->k256_d_grid[(size_t) global_n * (K / 256) + global_sb];
+                                const double value = d * ((double) lo_c[(size_t) m * n_segment.size_n + n]
+                                                      + 128.0 * (double) hi_c[(size_t) m * n_segment.size_n + n]) + zsum;
+                                float * out = dst_data + (size_t) m * N + global_n;
+                                if (k_idx == 0 && sb == 0) {
+                                    *out = (float) value;
+                                } else {
+                                    *out += (float) value;
+                                }
+
+                            }
+                        }
+                    }
+                }
+
+                continue;
+            }
+
             const bool quantized_A = pipeline->npu_type_a != rknpu2_configuration::NPU_TYPE_FP16;
             std::vector<std::vector<float>> scales_A_per_segment(num_a_matrices);
             if (quantized_A) {
@@ -870,6 +1307,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     scales.resize(M, 1.0f);
                 }
             }
+            std::vector<float> sum_A(M, 0.0f);
             {
                 const float * x = (const float *) get_tensor_real_ptr(src1);
                 const int row_stride = (int) (src1->nb[1] / sizeof(float));
@@ -902,6 +1340,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) {
                             auto * dst_row = (uint16_t *) dst_base + (size_t) m * K_seg_op;
                             rknpu2_quantization::convert_fp32_to_fp16(ready, dst_row, K_seg_op);
+                            if (!zeros_B_grid.empty()) {
+                                float sum = 0.0f;
+                                for (int k = 0; k < K_seg_op; ++k) {
+                                    sum += ggml_fp16_to_fp32(dst_row[k]);
+                                }
+                                sum_A[m] = sum;
+                            }
                         } else {
                             const float divisor = pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 ? 127.0f : 7.0f;
                             float & scale = scales_A_per_segment[idx][m];
@@ -937,6 +1382,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
 
+            if (pipeline->use_q4k_staged_int8) {
+                for (size_t idx = 0; idx < num_active_segments; ++idx) {
+                    auto & mem_B = k_plan.mem_B_segments[idx];
+                    stage_q4k_int8_segment_fused(src0, src0->data, K, N, k_seg, active_n_segments[idx],
+                                                scales_B_grid, k_idx, mem_B.get());
+                    RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_B.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync staged B TO_DEVICE");
+                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_B.get(), &matmul_ctxs[idx]->io_attr.B), "set staged B at run");
+                }
+            }
+
 #ifdef GGML_RKNPU2_DEBUG
             auto t3_start = std::chrono::high_resolution_clock::now();
             node_t_prepA += std::chrono::duration_cast<std::chrono::microseconds>(t3_start - t2_start).count();
@@ -948,7 +1403,26 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 std::atomic<bool> run_failed { false };
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
+                    auto & matmul_ctx = matmul_ctxs[idx];
+                    auto & mem_A = mem_A_segments[is_lowrank ? idx : 0];
+                    if (matmul_ctx->mem_A_bound != mem_A.get()) {
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_A.get(), &matmul_ctx->io_attr.A), "set_io_mem A at run");
+                        matmul_ctx->mem_A_bound = mem_A.get();
+                    }
+
+                    auto & mem_C = mem_C_segments[idx];
+                    if (matmul_ctx->mem_C_bound != mem_C.get()) {
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C.get(), &matmul_ctx->io_attr.C), "set_io_mem C at run");
+                        matmul_ctx->mem_C_bound = mem_C.get();
+                    }
+
+                    if (pipeline->use_q4k_block32_asym) {
+                        auto & mem_B = k_plan.mem_B_segments[idx];
+                        mem_B->offset = (int32_t) k_plan.b_offsets[idx];
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B.get(), &matmul_ctx->io_attr.B), "set exact B segment");
+                    }
+
+                    int ret = rknn_matmul_run(matmul_ctx->ctx);
                     if (trace_enabled()) {
                         std::call_once(trace_run_once, [ret]() {
                             fprintf(stderr, "RKNPU trace: rknn_matmul_run returned %d\n", ret);
@@ -982,20 +1456,23 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         const float scale_A = scales_A.empty() ? 1.0f : scales_A[m];
                         const float * scales_B = is_lowrank ? lowrank_factors[k_idx * num_active_segments + idx].u.data() :
                                                 (scales_B_grid.empty() ? nullptr : scales_B_grid.data() + k_idx * N + segment.offset_n);
+                        const float * zeros_B = is_lowrank ? nullptr :
+                                                (zeros_B_grid.empty() ? nullptr : zeros_B_grid.data() + k_idx * N + segment.offset_n);
+                        const float zero_sum = zeros_B ? sum_A[m] : 0.0f;
                         float * output = dst_data + (size_t) m * N + segment.offset_n;
                         const size_t row_offset = (size_t) m * segment.size_n;
                         switch (pipeline->npu_type_c) {
                             case rknpu2_configuration::NPU_TYPE_FP32:
                                 collect_rknpu_row((const float *) mem_C_segments[idx]->virt_addr + row_offset, output,
-                                                 segment.size_n, scales_B, scale_A / hadamard_divisor, k_idx != 0);
+                                                 segment.size_n, scales_B, zeros_B, scale_A / hadamard_divisor, zero_sum, k_idx != 0);
                                 break;
                             case rknpu2_configuration::NPU_TYPE_INT32:
                                 collect_rknpu_row((const int32_t *) mem_C_segments[idx]->virt_addr + row_offset, output,
-                                                 segment.size_n, scales_B, scale_A / hadamard_divisor, k_idx != 0);
+                                                 segment.size_n, scales_B, nullptr, scale_A / hadamard_divisor, 0.0f, k_idx != 0);
                                 break;
                             case rknpu2_configuration::NPU_TYPE_INT16:
                                 collect_rknpu_row((const int16_t *) mem_C_segments[idx]->virt_addr + row_offset, output,
-                                                 segment.size_n, scales_B, scale_A / hadamard_divisor, k_idx != 0);
+                                                 segment.size_n, scales_B, nullptr, scale_A / hadamard_divisor, 0.0f, k_idx != 0);
                                 break;
                             default:
                                 GGML_ABORT("Unsupported RKNPU output type");
@@ -1054,6 +1531,9 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
     const auto* pipeline = config.resolve_op_support(tensor);
 
     if (pipeline) {
+        if (pipeline->use_q4k_staged_int8) {
+            return 0;
+        }
         if (tensor->ne[0] <= 0 || tensor->ne[0] > INT32_MAX || tensor->ne[1] <= 0 || tensor->ne[1] > INT32_MAX ||
             tensor->ne[2] != 1 || tensor->ne[3] != 1 || (pipeline->use_hadamard && tensor->ne[0] > (1 << 30))) {
             return 0;
@@ -1067,6 +1547,13 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
         }
 
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+
+        if (pipeline->use_q4k_k256) {
+            if (tensor->type != GGML_TYPE_Q4_K || K % 256 != 0) {
+                return 0;
+            }
+            return (size_t) N * K + (size_t) N * K / 2;
+        }
 
         int k_limit = config.max_k_limit;
         if (pipeline->effective_k > 0) {
@@ -1164,6 +1651,149 @@ static void dequantize_row(
         dequantize_row_q4_K(src + (size_t)n * (K / QK_K), row_out, K);
     } else {
         GGML_ASSERT(false && "Unsupported weight type for NPU pipeline");
+    }
+}
+
+// Decode the 6-bit scale/min pair of one 32-element Q4_K sub-block.
+static inline void rknpu_get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+// Extract one 32-element Q4_K sub-block exactly.
+// The stored q is mapped to signed int4 q' = q - 8.
+// The affine reconstruction is x = scale * q' + zero.
+static void extract_q4k_asym_segment(
+    std::vector<uint8_t> & out_q,
+    std::vector<float> & scales,
+    std::vector<float> & zeros,
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K, int N,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg)
+{
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(k_seg.size_k == 32 && k_seg.offset_k % 32 == 0);
+
+    const int K_seg = k_seg.size_k;
+    const int N_seg = n_seg.size_n;
+    out_q.assign((size_t) N_seg * (K_seg / 2), 0);
+    scales.assign(N_seg, 1.0f);
+    zeros.assign(N_seg, 0.0f);
+
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, K);
+    const int block_idx = k_seg.offset_k / QK_K;
+    const int sub = (k_seg.offset_k % QK_K) / 32;
+
+    #pragma omp parallel for
+    for (int i = 0; i < N_seg; ++i) {
+        const int global_n = n_seg.offset_n + i;
+        if (global_n >= N) {
+            continue;
+        }
+
+        const uint8_t * row_ptr = (const uint8_t *) raw_data + (size_t) global_n * row_bytes;
+        const block_q4_K * blk = (const block_q4_K *) row_ptr + block_idx;
+
+        uint8_t sc = 0;
+        uint8_t m = 0;
+        rknpu_get_scale_min_k4(sub, blk->scales, &sc, &m);
+
+        const float d = ggml_fp16_to_fp32(blk->d);
+        const float dmin = ggml_fp16_to_fp32(blk->dmin);
+        const float scale = d * sc;
+        scales[i] = scale;
+        zeros[i] = 8.0f * scale - dmin * m;
+
+        const uint8_t * qsrc = blk->qs + (sub / 2) * 32;
+        uint8_t * qdst = out_q.data() + (size_t) i * (K_seg / 2);
+        for (int l = 0; l < 32; ++l) {
+            const uint8_t qraw = (sub & 1) ? (qsrc[l] >> 4) : (qsrc[l] & 0xF);
+            const uint8_t qs = (uint8_t) (qraw - 8) & 0x0F;
+            if ((l & 1) == 0) {
+                qdst[l / 2] |= qs;
+            } else {
+                qdst[l / 2] |= (uint8_t) (qs << 4);
+            }
+        }
+    }
+}
+
+// Extract one Q4_K K=256 segment for the INT8+INT4 decomposition pipeline.
+// P_L is row-major INT8, P_H is row-major packed INT4, d is per superblock,
+// and z is per 32-element group.
+static void extract_q4k_k256_segment(
+    std::vector<uint8_t> & out_lo,
+    std::vector<uint8_t> & out_hi,
+    std::vector<float> & out_d,
+    std::vector<float> & out_z,
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K, int N,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg)
+{
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(k_seg.size_k % 256 == 0 && k_seg.offset_k % 256 == 0);
+
+    const int K_seg = k_seg.size_k;
+    const int N_seg = n_seg.size_n;
+    const int sb_count = K_seg / 256;
+    const int group_count = K_seg / 32;
+
+    out_lo.assign((size_t) N_seg * K_seg, 0);
+    out_hi.assign((size_t) N_seg * (K_seg / 2), 0);
+    out_d.assign((size_t) N_seg * sb_count, 0.0f);
+    out_z.assign((size_t) N_seg * group_count, 0.0f);
+
+    const size_t row_bytes = ggml_row_size(GGML_TYPE_Q4_K, K);
+
+    #pragma omp parallel for
+    for (int i = 0; i < N_seg; ++i) {
+        const int global_n = n_seg.offset_n + i;
+        if (global_n >= N) {
+            continue;
+        }
+
+        const uint8_t * row_ptr = (const uint8_t *) raw_data + (size_t) global_n * row_bytes;
+        uint8_t * lo_row = out_lo.data() + (size_t) i * K_seg;
+        uint8_t * hi_row = out_hi.data() + (size_t) i * (K_seg / 2);
+        float * d_row = out_d.data() + (size_t) i * sb_count;
+        float * z_row = out_z.data() + (size_t) i * group_count;
+
+        for (int sb = 0; sb < sb_count; ++sb) {
+            const int global_sb = k_seg.offset_k / 256 + sb;
+            const block_q4_K * blk = (const block_q4_K *) row_ptr + global_sb;
+            const float d = ggml_fp16_to_fp32(blk->d);
+            const float dmin = ggml_fp16_to_fp32(blk->dmin);
+            d_row[sb] = d;
+
+            for (int j = 0; j < 8; ++j) {
+                uint8_t sc = 0;
+                uint8_t m = 0;
+                rknpu_get_scale_min_k4(j, blk->scales, &sc, &m);
+                z_row[sb * 8 + j] = 8.0f * d * (float) sc - dmin * (float) m;
+
+                const uint8_t * qsrc = blk->qs + (j / 2) * 32;
+                for (int l = 0; l < 32; ++l) {
+                    const int qraw = (j & 1) ? (qsrc[l] >> 4) : (qsrc[l] & 0xF);
+                    const int p = (int) sc * (qraw - 8);
+                    const int hi = (p + 64 >= 0) ? (p + 64) / 128 : -((-(p + 64) + 127) / 128);
+                    const int lo = p - 128 * hi;
+                    const int kk = sb * 256 + j * 32 + l;
+                    lo_row[kk] = (uint8_t) (int8_t) lo;
+                    const uint8_t hv = (uint8_t) (hi & 0xF);
+                    if ((kk & 1) == 0) hi_row[kk / 2] |= hv;
+                    else              hi_row[kk / 2] |= (uint8_t) (hv << 4);
+                }
+            }
+        }
     }
 }
 
@@ -1341,6 +1971,95 @@ static size_t pack_tensor_segment(
     return segment_packed_size;
 }
 
+// Fill a shared native INT8 B scratch buffer for one Q4_K (K segment, N segment).
+// The source GGUF Q4_K bytes stay resident; only this bounded scratch is materialized.
+static void stage_q4k_int8_segment(
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K,
+    int N,
+    int K_op,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg,
+    const std::vector<float> & scales_grid,
+    size_t k_idx,
+    rknn_tensor_mem * mem_B,
+    const rknpu2_configuration::Rknpu2HardwarePipeline * pipeline)
+{
+    std::vector<float> fp32_segment;
+    std::vector<uint8_t> int8_segment;
+    dequantize_tensor_segment(fp32_segment, tensor, nullptr, raw_data, K, N, K_op, k_seg, n_seg, false);
+
+    std::vector<float> segment_scales((size_t) n_seg.size_n);
+    for (int i = 0; i < n_seg.size_n; ++i) {
+        segment_scales[i] = scales_grid[k_idx * (size_t) N + n_seg.offset_n + i];
+    }
+    quantize_tensor_segment(fp32_segment, int8_segment, k_seg, n_seg, segment_scales,
+                            rknpu2_configuration::NPU_TYPE_INT8);
+    pack_tensor_segment(int8_segment, (uint8_t *) mem_B->virt_addr, k_seg, n_seg, pipeline);
+}
+
+// Fused Q4_K -> INT8 converter that writes the NPU native layout directly.
+// It avoids materializing the full FP32 segment and the row-major INT8 intermediate.
+static void stage_q4k_int8_segment_fused(
+    const struct ggml_tensor * tensor,
+    const void * raw_data,
+    int K,
+    int N,
+    const MatrixSegmentK & k_seg,
+    const MatrixSegmentN & n_seg,
+    const std::vector<float> & scales_grid,
+    size_t k_idx,
+    rknn_tensor_mem * mem_B)
+{
+    UNUSED(tensor);
+    GGML_ASSERT(k_seg.offset_k % 256 == 0);
+    GGML_ASSERT(k_seg.size_k % 32 == 0);
+    GGML_ASSERT(n_seg.offset_n % 16 == 0);
+    GGML_ASSERT(n_seg.size_n % 16 == 0);
+
+    const uint8_t * raw = (const uint8_t *) raw_data;
+    const size_t row_bytes = (size_t) (K / 256) * sizeof(block_q4_K);
+    const int k_blocks = k_seg.size_k / 32;
+    const int n_blocks = n_seg.size_n / 16;
+    const size_t kblock_stride = 16 * 32;
+    const size_t nblock_stride = (size_t) k_blocks * kblock_stride;
+    uint8_t * dst = (uint8_t *) mem_B->virt_addr;
+
+    #pragma omp parallel for collapse(2)
+    for (int nb = 0; nb < n_blocks; ++nb) {
+        for (int kb = 0; kb < k_blocks; ++kb) {
+            const int local_k = kb * 32;
+            const int global_group = (k_seg.offset_k + local_k) / 32;
+            const int sb = global_group / 8;
+            const int j = global_group % 8;
+            const bool high_nibble = (j & 1) != 0;
+            const int q_offset = (j / 2) * 32;
+
+            for (int ni = 0; ni < 16; ++ni) {
+                const int n_global = n_seg.offset_n + nb * 16 + ni;
+                const block_q4_K * blk = (const block_q4_K *) (raw
+                    + (size_t) n_global * row_bytes
+                    + (size_t) sb * sizeof(block_q4_K));
+                uint8_t sc = 0, m = 0;
+                rknpu_get_scale_min_k4(j, blk->scales, &sc, &m);
+                const float d    = ggml_fp16_to_fp32(blk->d) * (float) sc;
+                const float dmin = ggml_fp16_to_fp32(blk->dmin) * (float) m;
+                const float inv_scale = 1.0f / scales_grid[k_idx * (size_t) N + n_global];
+                const uint8_t * q = blk->qs + q_offset;
+                uint8_t * out = dst + (size_t) nb * nblock_stride
+                    + (size_t) kb * kblock_stride + (size_t) ni * 32;
+                for (int l = 0; l < 32; ++l) {
+                    const int qv = high_nibble ? (q[l] >> 4) : (q[l] & 0x0F);
+                    int iv = (int) std::lrintf((d * (float) qv - dmin) * inv_scale);
+                    iv = std::max(-127, std::min(127, iv));
+                    out[l] = (int8_t) iv;
+                }
+            }
+        }
+    }
+}
+
 static rknpu2_weight_cache::Descriptor build_weight_cache_descriptor(
     const struct ggml_tensor * tensor,
     const rknpu2_configuration::Rknpu2DeviceConfig & config,
@@ -1445,6 +2164,39 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         return;
     }
 
+    const bool staged_q4k = pipeline->use_q4k_staged_int8 && tensor->type == GGML_TYPE_Q4_K;
+    if (staged_q4k) {
+        if (offset + size != tensor_size) {
+            return;
+        }
+        const int K = (int) tensor->ne[0];
+        const int N = (int) tensor->ne[1];
+        int k_limit = config.max_k_limit;
+        if (pipeline->effective_k > 0) {
+            k_limit = k_limit > 0 ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+        }
+        const auto k_segments = compute_k_segments(K, k_limit, pipeline->k_align);
+        std::vector<float> scales(k_segments.size() * (size_t) N, 1.0f);
+        #pragma omp parallel for
+        for (int n = 0; n < N; ++n) {
+            std::vector<float> row(K);
+            dequantize_row(tensor, tensor->data, n, K, row.data());
+            for (size_t k_idx = 0; k_idx < k_segments.size(); ++k_idx) {
+                const auto & k_seg = k_segments[k_idx];
+                float amax = 0.0f;
+                for (int k = k_seg.offset_k; k < k_seg.offset_k + k_seg.size_k; ++k) {
+                    amax = std::max(amax, std::abs(row[k]));
+                }
+                scales[k_idx * (size_t) N + n] = amax == 0.0f ? 1.0f : amax / 127.0f;
+            }
+        }
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->quantized_tensor_scales[tensor] = std::move(scales);
+        ctx->quantized_tensor_zeros.erase(tensor);
+        ++ctx->tensor_versions[tensor];
+        return;
+    }
+
     const size_t required_size = get_tensor_packed_size(tensor);
     if (required_size == 0) {
         return;
@@ -1456,6 +2208,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     const bool is_lowrank = pipeline->use_lowrank &&
         (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 ||
          pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4);
+    const bool use_q4k_exact = pipeline->use_q4k_block32_asym &&
+        tensor->type == GGML_TYPE_Q4_K && !pipeline->use_hadamard && !is_lowrank;
+    const bool use_q4k_k256 = pipeline->use_q4k_k256 &&
+        tensor->type == GGML_TYPE_Q4_K && !pipeline->use_hadamard && !is_lowrank;
 
     int k_limit = config.max_k_limit;
     if (pipeline->effective_k > 0) {
@@ -1484,7 +2240,74 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         }
     }
 
-    const bool use_weight_cache = rknpu2_weight_cache::enabled();
+    if (use_q4k_k256) {
+        std::vector<float> k256_d((size_t) N * (K / 256), 0.0f);
+        std::vector<float> k256_z((size_t) N * (K / 32), 0.0f);
+        std::vector<uint8_t> seg_lo;
+        std::vector<uint8_t> seg_hi;
+        std::vector<float> seg_d;
+        std::vector<float> seg_z;
+
+        for (size_t k_idx = 0; k_idx < k_segments.size(); ++k_idx) {
+            const auto & k_seg = k_segments[k_idx];
+            GGML_ASSERT(k_seg.size_k % 256 == 0);
+            for (const auto & n_seg : n_segments) {
+                if (n_seg.size_n == 0) {
+                    continue;
+                }
+                extract_q4k_k256_segment(seg_lo, seg_hi, seg_d, seg_z,
+                                         tensor, tensor->data, K, N, k_seg, n_seg);
+
+                const int N_seg = n_seg.size_n;
+                const int K_seg = k_seg.size_k;
+                for (int sb = 0; sb < K_seg / 256; ++sb) {
+                    std::vector<uint8_t> lo_pack((size_t) N_seg * 256);
+                    std::vector<uint8_t> hi_pack((size_t) N_seg * 128);
+                    for (int i = 0; i < N_seg; ++i) {
+                        memcpy(lo_pack.data() + (size_t) i * 256,
+                               seg_lo.data() + (size_t) i * K_seg + (size_t) sb * 256, 256);
+                        memcpy(hi_pack.data() + (size_t) i * 128,
+                               seg_hi.data() + (size_t) i * (K_seg / 2) + (size_t) sb * 128, 128);
+                    }
+
+                    uint8_t * dst_lo = tensor_dma_ptr
+                        + (size_t) n_seg.offset_n * K
+                        + (size_t) (k_seg.offset_k + sb * 256) * N_seg;
+                    uint8_t * dst_hi = tensor_dma_ptr
+                        + (size_t) N * K
+                        + (size_t) n_seg.offset_n * (K / 2)
+                        + (size_t) (k_seg.offset_k + sb * 256) * (N_seg / 2);
+                    pack_native(dst_lo, lo_pack.data(), 256, 0, 256, 32, N_seg, 0, N_seg, 16, 8);
+                    pack_native(dst_hi, hi_pack.data(), 256, 0, 256, 32, N_seg, 0, N_seg, 16, 4);
+                }
+
+                for (int i = 0; i < N_seg; ++i) {
+                    const int global_n = n_seg.offset_n + i;
+                    for (int sb = 0; sb < K_seg / 256; ++sb) {
+                        k256_d[(size_t) global_n * (K / 256) + k_seg.offset_k / 256 + sb] =
+                            seg_d[(size_t) i * (K_seg / 256) + sb];
+                    }
+                    for (int g = 0; g < K_seg / 32; ++g) {
+                        k256_z[(size_t) global_n * (K / 32) + k_seg.offset_k / 32 + g] =
+                            seg_z[(size_t) i * (K_seg / 32) + g];
+                    }
+                }
+            }
+        }
+
+        RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync K256 B TO_DEVICE");
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        ctx->q4k_k256_d[tensor] = std::move(k256_d);
+        ctx->q4k_k256_z[tensor] = std::move(k256_z);
+        ctx->quantized_tensor_scales.erase(tensor);
+        ctx->quantized_tensor_zeros.erase(tensor);
+        ctx->lowrank_segment_factors.erase(tensor);
+        ctx->hadamard_s_vectors.erase(tensor);
+        ++ctx->tensor_versions[tensor];
+        return;
+    }
+
+    const bool use_weight_cache = rknpu2_weight_cache::enabled() && !use_q4k_exact;
     rknpu2_weight_cache::Descriptor cache_descriptor;
     if (use_weight_cache) {
         const auto source_hash = rknpu2_weight_cache::hash_source(tensor->data, tensor_size);
@@ -1541,10 +2364,15 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     std::vector<float> seg_fp32;
     std::vector<uint8_t> seg_npu;
     std::vector<float> segment_scales;
+    std::vector<float> segment_zeros;
     uint8_t * current_write_ptr = tensor_dma_ptr;
     std::vector<float> per_channel_scales;
+    std::vector<float> per_channel_zeros;
     if (!is_lowrank && pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16) {
         per_channel_scales.resize(k_segments.size() * (size_t) N, 1.0f);
+    }
+    if (use_q4k_exact) {
+        per_channel_zeros.resize(k_segments.size() * (size_t) N, 0.0f);
     }
     std::vector<LowRankSegmentFactors> lowrank_factors;
     if (is_lowrank) {
@@ -1558,42 +2386,51 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             if (n_seg.size_n == 0) {
                 continue;
             }
-            dequantize_tensor_segment(seg_fp32, tensor, ctx, tensor->data, K, N, K_op, k_seg, n_seg, pipeline->use_hadamard);
-            if (is_lowrank) {
-                const float qmax = pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 ? 7.0f : 127.0f;
-                const int K_seg = k_seg.size_k;
-                const int N_seg = n_seg.size_n;
-                auto & factors = lowrank_factors[k_idx * active_n_count + n_idx];
-                factors.v.resize(K_seg);
-                factors.u.resize(N_seg);
-                rknpu2_calibration::lowrank_decomposition(seg_fp32.data(), K_seg, N_seg, qmax, factors.u.data(), factors.v.data());
-                segment_scales.resize((size_t) N_seg * K_seg);
-                #pragma omp parallel for
-                for (int i = 0; i < N_seg; ++i) {
-                    float * row_scales = segment_scales.data() + (size_t) i * K_seg;
-                    for (int j = 0; j < K_seg; ++j) {
-                        row_scales[j] = std::max(factors.v[j] * factors.u[i], 1e-7f);
-                    }
-                }
-            } else if (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16) {
-                const float quant_divisor = pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 ? 7.0f : 127.0f;
-                segment_scales.resize(n_seg.size_n);
-                #pragma omp parallel for
+            if (use_q4k_exact) {
+                extract_q4k_asym_segment(seg_npu, segment_scales, segment_zeros, tensor, tensor->data, K, N, k_seg, n_seg);
                 for (int i = 0; i < n_seg.size_n; ++i) {
-                    const float * row = seg_fp32.data() + (size_t) i * k_seg.size_k;
-                    float amax = 0.0f;
-                    for (int j = 0; j < k_seg.size_k; ++j) {
-                        amax = std::max(amax, std::abs(row[j]));
-                    }
-                    const float scale = amax == 0.0f ? 1.0f : amax / quant_divisor;
-                    segment_scales[i] = scale;
-                    per_channel_scales[k_idx * (size_t) N + n_seg.offset_n + i] = scale;
+                    const size_t dst_idx = k_idx * (size_t) N + n_seg.offset_n + i;
+                    per_channel_scales[dst_idx] = segment_scales[i];
+                    per_channel_zeros[dst_idx] = segment_zeros[i];
                 }
             } else {
-                segment_scales.assign(n_seg.size_n, 1.0f);
-            }
+                dequantize_tensor_segment(seg_fp32, tensor, ctx, tensor->data, K, N, K_op, k_seg, n_seg, pipeline->use_hadamard);
+                if (is_lowrank) {
+                    const float qmax = pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 ? 7.0f : 127.0f;
+                    const int K_seg = k_seg.size_k;
+                    const int N_seg = n_seg.size_n;
+                    auto & factors = lowrank_factors[k_idx * active_n_count + n_idx];
+                    factors.v.resize(K_seg);
+                    factors.u.resize(N_seg);
+                    rknpu2_calibration::lowrank_decomposition(seg_fp32.data(), K_seg, N_seg, qmax, factors.u.data(), factors.v.data());
+                    segment_scales.resize((size_t) N_seg * K_seg);
+                    #pragma omp parallel for
+                    for (int i = 0; i < N_seg; ++i) {
+                        float * row_scales = segment_scales.data() + (size_t) i * K_seg;
+                        for (int j = 0; j < K_seg; ++j) {
+                            row_scales[j] = std::max(factors.v[j] * factors.u[i], 1e-7f);
+                        }
+                    }
+                } else if (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16) {
+                    const float quant_divisor = pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4 ? 7.0f : 127.0f;
+                    segment_scales.resize(n_seg.size_n);
+                    #pragma omp parallel for
+                    for (int i = 0; i < n_seg.size_n; ++i) {
+                        const float * row = seg_fp32.data() + (size_t) i * k_seg.size_k;
+                        float amax = 0.0f;
+                        for (int j = 0; j < k_seg.size_k; ++j) {
+                            amax = std::max(amax, std::abs(row[j]));
+                        }
+                        const float scale = amax == 0.0f ? 1.0f : amax / quant_divisor;
+                        segment_scales[i] = scale;
+                        per_channel_scales[k_idx * (size_t) N + n_seg.offset_n + i] = scale;
+                    }
+                } else {
+                    segment_scales.assign(n_seg.size_n, 1.0f);
+                }
 
-            quantize_tensor_segment(seg_fp32, seg_npu, k_seg, n_seg, segment_scales, pipeline->npu_type_b);
+                quantize_tensor_segment(seg_fp32, seg_npu, k_seg, n_seg, segment_scales, pipeline->npu_type_b);
+            }
             current_write_ptr += pack_tensor_segment(seg_npu, current_write_ptr, k_seg, n_seg, pipeline);
             ++n_idx;
         }
@@ -1615,6 +2452,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
     std::lock_guard<std::mutex> lock(ctx->mutex);
     ctx->quantized_tensor_scales[tensor] = std::move(per_channel_scales);
+    if (use_q4k_exact) {
+        ctx->quantized_tensor_zeros[tensor] = std::move(per_channel_zeros);
+    } else {
+        ctx->quantized_tensor_zeros.erase(tensor);
+    }
     if (is_lowrank) {
         ctx->lowrank_segment_factors[tensor] = std::move(lowrank_factors);
     } else {
@@ -1787,7 +2629,8 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             if (src0->type == GGML_TYPE_Q4_K && ggml_nrows(src1) <= 4) {
                 return false;
             }
-            if (get_tensor_packed_size(src0) == 0 || src1->ne[1] <= 0 || src1->ne[1] > (1 << 30) || op->type != GGML_TYPE_F32) {
+            const bool staged_q4k = pipeline->use_q4k_staged_int8 && src0->type == GGML_TYPE_Q4_K;
+            if ((!staged_q4k && get_tensor_packed_size(src0) == 0) || src1->ne[1] <= 0 || src1->ne[1] > (1 << 30) || op->type != GGML_TYPE_F32) {
                 return false;
             }
 

@@ -74,6 +74,13 @@ struct Rknpu2HardwarePipeline {
     int effective_k;            // Specific K limit for matrix tiling
     bool use_hadamard;          // Flag for using Hadamard Transform
     bool use_lowrank;           // Flag for using Low-Rank Approximation
+    bool use_q4k_block32_asym = false; // Use exact Q4_K 32-element sub-block scale/min
+    bool use_q4k_k256 = false;          // Use Q4_K K=256 INT8+INT4 decomposition
+    bool use_q4k_hybrid = false;        // Explicit tensor-name hybrid: exact attention/SSM + W8A16 FFN
+    Rknpu2NpuType npu_type_b_secondary = NPU_TYPE_INT4; // Secondary B type for Q4_K K256 (INT4 high part)
+    rknn_matmul_type mm_type_secondary = RKNN_FLOAT16_MM_INT4_TO_FLOAT32; // Secondary matmul type for Q4_K K256
+    bool use_q4k_staged_int8 = false;   // Keep native Q4_K storage and stage INT8 weights per execution
+    bool use_q4k_ffn_int4_hybrid = false; // Q4_K FFN uses platform INT4 Hadamard; other Q4_K uses platform INT8
 };
 
 /**
